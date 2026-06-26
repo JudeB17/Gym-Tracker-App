@@ -3,7 +3,8 @@
    Depends on: window.GymData, window.GymStore
    ============================================================ */
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
-const { MUSCLES, LIB, T, rpHint, defaultProgram } = window.GymData;
+const { MUSCLES, LIB, T, rpHint, defaultProgram,
+        GOALS, SPLITS, splitsForDays, generateProgram, applyWeek, mesoStatus } = window.GymData;
 const { sGet, sSet, sDel, available } = window.GymStore;
 
 /* ---------- theme ---------- */
@@ -149,7 +150,7 @@ function App() {
         const ex = exByKey(it.key); if (!ex) return null;
         const tw = effectiveTargetW(it.key, it.target);
         const nSets = it.target?.sets || 1;
-        return { eid: uid(), key: it.key, name: ex.n, t: ex.t, note: "",
+        return { eid: uid(), key: it.key, name: ex.n, t: ex.t, note: "", est: !!it.est,
           target: { ...it.target, w: tw },
           sets: Array.from({ length: nSets }, () => blankSet(ex.t)) };
       }).filter(Boolean)
@@ -266,6 +267,33 @@ function App() {
 
   const resetProgram = useCallback(async () => { const fresh = defaultProgram(); await saveProgram(fresh); setActiveDayId(fresh.days[0].id); flash("Program reset."); }, [saveProgram, flash]);
 
+  /* ---- generated mesocycle program ---- */
+  const installGenerated = useCallback(async prog => {
+    const p = { ...prog };
+    if (p.meso) p.meso.startedOn = TODAY();
+    await saveProgram(p);
+    setActiveDayId(p.days[0]?.id ?? null);
+    setTab("log");
+    flash("Program installed.");
+  }, [saveProgram, flash]);
+
+  const advanceWeek = useCallback(async () => {
+    if (!program || !program.meso) return;
+    const next = Math.min(program.meso.week + 1, program.meso.totalWeeks);
+    const updated = applyWeek(program, next);
+    await saveProgram(updated);
+    const st = mesoStatus(updated);
+    flash(st && st.isDeload ? "Deload week — back off." : `Advanced to week ${next}.`);
+  }, [program, saveProgram, flash]);
+
+  const exitMeso = useCallback(async () => {
+    if (!program) return;
+    const { meso, generated, ...rest } = program;
+    const stripped = { ...rest, days: program.days.map(d => { const { blueprint, ...dd } = d; return { ...dd, items: d.items.map(it => { const { tier, est, ...ii } = it; return ii; }) }; }) };
+    await saveProgram(stripped);
+    flash("Mesocycle ended — program kept as editable.");
+  }, [program, saveProgram, flash]);
+
   const openPicker = useCallback(onPick => setPicker({ onPick }), []);
 
   if (loading) return <Shell><div style={{ color: C.dim, padding: 40, textAlign: "center" }}>Loading…</div></Shell>;
@@ -297,9 +325,11 @@ function App() {
         {tab === "progress" && <Progress sessions={sessions} allEx={allEx} />}
         {tab === "trends" && <Trends sessions={sessions} />}
         {tab === "injury" && <InjuryTab injuries={injuries} saveInjuries={saveInjuries} sessions={sessions} />}
+        {tab === "goals" && <GoalsTab onInstall={installGenerated} current={program} setTab={setTab} />}
         {tab === "program" && <ProgramEditor program={program} setProgram={saveProgram} exByKey={exByKey}
           openPicker={openPicker} custom={custom} removeCustom={removeCustom}
-          exportJson={exportJson} importJson={importJson} onReset={resetProgram} />}
+          exportJson={exportJson} importJson={importJson} onReset={resetProgram}
+          onAdvanceWeek={advanceWeek} onExitMeso={exitMeso} />}
       </div>
       {picker && <Picker custom={custom} onAddCustom={addCustom} onPick={picker.onPick} onClose={() => setPicker(null)} />}
       {toast && <div style={{ position:"fixed", bottom:84, left:"50%", transform:"translateX(-50%)", background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:20, padding:"8px 18px", fontSize:13, zIndex:50 }}>{toast}</div>}
@@ -314,7 +344,7 @@ function Shell({ children }) {
   return <div style={{ maxWidth: 520, margin: "0 auto", minHeight: "100vh", background: C.bg, color: C.ink, fontFamily: "system-ui,-apple-system,sans-serif" }}>{children}</div>;
 }
 function Header({ tab, setTab }) {
-  const tabs = [["log","Log"],["history","History"],["progress","Progress"],["trends","Trends"],["injury","Injury"],["program","Program"]];
+  const tabs = [["log","Log"],["history","History"],["progress","Progress"],["trends","Trends"],["injury","Injury"],["goals","Goals"],["program","Program"]];
   return (
     <div style={{ position:"sticky", top:0, zIndex:40, background:C.bg, borderBottom:`1px solid ${C.line}` }}>
       <div style={{ padding:"14px 16px 8px", fontSize:20, fontWeight:800, letterSpacing:1 }}>GYM</div>
@@ -337,8 +367,21 @@ function Empty({ msg }) { return <div style={{ color:C.dim, fontSize:13, textAli
 function StartView({ program, activeDayId, setActiveDayId, onStart, sessions }) {
   const thisWeek = isoWeek(TODAY());
   const doneThisWeek = sessions.filter(s => isoWeek(s.date) === thisWeek).length;
+  const st = mesoStatus(program);
   return (
     <div>
+      {st && (
+        <div style={{ ...card, borderColor: st.isDeload ? C.gold : C.acc, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div>
+            <div style={{ fontSize:13, fontWeight:700, color: st.isDeload ? C.gold : C.acc }}>{st.label}</div>
+            <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{st.splitName} · {st.goalLabel}</div>
+          </div>
+          <div style={{ textAlign:"right" }}>
+            <div style={{ fontSize:18, fontWeight:700 }}>RIR {st.rir.lo}–{st.rir.hi}</div>
+            <div style={{ fontSize:10, color:C.dim }}>reps in reserve</div>
+          </div>
+        </div>
+      )}
       <div style={{ ...card, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div><div style={{ fontSize:13, color:C.dim }}>This week</div>
           <div style={{ fontSize:22, fontWeight:700 }}>{doneThisWeek}<span style={{ fontSize:14, color:C.dim }}> / {program.target}</span></div></div>
@@ -495,6 +538,7 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle }) {
           <div style={{ fontSize:14, fontWeight:600 }}>{entry.name} <span style={{ fontSize:10, color:C.dim, fontWeight:400 }}>· {T_LABEL[entry.t]}</span></div>
           <div style={{ display:"flex", gap:8, marginTop:2, flexWrap:"wrap" }}>
             {hint && <span style={{ fontSize:11, color:C.acc }}>{hint}</span>}
+            {entry.est && entry.target && entry.target.w != null && <span style={{ fontSize:10, color:C.gold }}>est · confirm</span>}
             {rp && <span style={{ fontSize:11, color:C.dim }}>{rp}</span>}
           </div>
           {prevStr && <div style={{ fontSize:10, color:C.dim, marginTop:2 }}>last: {prevStr}</div>}
@@ -817,10 +861,145 @@ function InjuryTab({ injuries, saveInjuries, sessions }) {
 }
 
 /* ============================================================
+   Goals tab — generate a science-based mesocycle
+   ============================================================ */
+function GoalsTab({ onInstall, current, setTab }) {
+  const [days, setDays] = useState(6);
+  const [goal, setGoal] = useState("gain");
+  const [accum, setAccum] = useState(4);
+  const [bench, setBench] = useState("");
+  const [squat, setSquat] = useState("");
+  const [dead, setDead] = useState("");
+  const [bw, setBw] = useState("");
+  const [options, setOptions] = useState(null);
+  const [preview, setPreview] = useState(null); // generated program being previewed
+
+  const sel = { background:C.bg, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"10px 12px", fontSize:14, width:"100%" };
+  const num = v => v === "" ? null : Number(v) || null;
+  const stats = { bench:num(bench), squat:num(squat), dead:num(dead), bodyweight:num(bw) };
+
+  const generate = () => {
+    const splits = splitsForDays(days);
+    setOptions(splits.map(s => ({
+      split: s,
+      prog: generateProgram({ splitId:s.id, goal, daysPerWeek:days, accumWeeks:accum, stats })
+    })));
+    setPreview(null);
+  };
+
+  const goalList = Object.values(GOALS);
+
+  return (
+    <div>
+      <div style={card}>
+        <div style={{ fontSize:12, color:C.dim, marginBottom:12, textTransform:"uppercase", letterSpacing:0.5 }}>Build a mesocycle</div>
+
+        <label style={{ fontSize:11, color:C.dim }}>Training days per week</label>
+        <div style={{ display:"flex", gap:6, marginTop:6, marginBottom:14 }}>
+          {[3,4,5,6].map(d => (
+            <button key={d} onClick={() => setDays(d)} style={{
+              flex:1, background: days===d ? C.panel2 : C.bg, color: days===d ? C.acc : C.dim,
+              border:`1px solid ${days===d ? C.acc : C.line}`, borderRadius:8, padding:"10px 0", fontSize:15, fontWeight:600, cursor:"pointer" }}>{d}</button>
+          ))}
+        </div>
+
+        <label style={{ fontSize:11, color:C.dim }}>Goal</label>
+        <div style={{ display:"flex", gap:6, marginTop:6, marginBottom:14 }}>
+          {goalList.map(g => (
+            <button key={g.id} onClick={() => setGoal(g.id)} style={{
+              flex:1, background: goal===g.id ? C.panel2 : C.bg, color: goal===g.id ? C.acc : C.dim,
+              border:`1px solid ${goal===g.id ? C.acc : C.line}`, borderRadius:8, padding:"10px 4px", fontSize:13, fontWeight:600, cursor:"pointer" }}>{g.label}</button>
+          ))}
+        </div>
+
+        <label style={{ fontSize:11, color:C.dim }}>Mesocycle length</label>
+        <select style={{ ...sel, marginTop:6, marginBottom:14 }} value={accum} onChange={e => setAccum(Number(e.target.value))}>
+          <option value={3}>3 accumulation + 1 deload (4 wk)</option>
+          <option value={4}>4 accumulation + 1 deload (5 wk)</option>
+          <option value={5}>5 accumulation + 1 deload (6 wk)</option>
+          <option value={6}>6 accumulation + 1 deload (7 wk)</option>
+        </select>
+
+        <div style={{ fontSize:11, color:C.dim, marginBottom:6 }}>Strength stats — working weight or est. 1RM (kg). Used to seed barbell loads; leave blank to start those blank too.</div>
+        <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+          <StatIn label="Bench" val={bench} onChange={setBench} />
+          <StatIn label="Squat" val={squat} onChange={setSquat} />
+          <StatIn label="Deadlift" val={dead} onChange={setDead} />
+        </div>
+        <StatIn label="Bodyweight" val={bw} onChange={setBw} wide />
+
+        <button onClick={generate} style={{ ...btn(C.acc, "#04150E"), marginTop:14 }}>Generate programs</button>
+      </div>
+
+      {options && options.length > 0 && !preview && (
+        <div style={{ marginTop:4 }}>
+          <div style={{ fontSize:12, color:C.dim, margin:"16px 4px 4px", textTransform:"uppercase", letterSpacing:0.5 }}>{options.length} option{options.length>1?"s":""} for {days} days</div>
+          {options.map(({ split, prog }) => (
+            <div key={split.id} style={card}>
+              <div style={{ fontSize:15, fontWeight:700 }}>{split.name}</div>
+              <div style={{ fontSize:12, color:C.dim, marginTop:3 }}>{split.blurb}</div>
+              <div style={{ fontSize:11, color:C.dim, marginTop:6 }}>{prog.days.length} sessions/wk · {prog.days.map(d=>d.name).join(" · ")}</div>
+              <div style={{ display:"flex", gap:10, marginTop:12 }}>
+                <button onClick={() => setPreview({ split, prog })} style={btn(C.panel2, C.ink)}>Preview</button>
+                <button onClick={() => onInstall(prog)} style={btn(C.acc, "#04150E")}>Use this</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {preview && (
+        <div style={{ marginTop:4 }}>
+          <div style={{ display:"flex", gap:10, alignItems:"center", margin:"16px 0 4px" }}>
+            <button onClick={() => setPreview(null)} style={{ background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 14px", fontSize:13, cursor:"pointer" }}>← Back</button>
+            <div style={{ flex:1, fontSize:15, fontWeight:700 }}>{preview.split.name}</div>
+          </div>
+          {preview.prog.meso.cardio && <div style={{ ...card, fontSize:12, color:C.dim }}>Cardio: {preview.prog.meso.cardio.note}<br/>Calories: {preview.prog.meso.nutrition.cal} · Protein: {preview.prog.meso.nutrition.protein}</div>}
+          {preview.prog.days.map(d => (
+            <div key={d.id} style={card}>
+              <div style={{ fontSize:14, fontWeight:700, marginBottom:8 }}>{d.name}</div>
+              {d.items.map((it, i) => {
+                const ex = LIB.find(l => l.key === it.key);
+                const t = it.target;
+                const reps = t.repLo === t.repHi ? `${t.repLo}` : `${t.repLo}–${t.repHi}`;
+                return (
+                  <div key={i} style={{ display:"flex", justifyContent:"space-between", fontSize:13, padding:"4px 0", borderBottom: i<d.items.length-1?`1px solid ${C.line}`:"none" }}>
+                    <span>{ex ? ex.n : it.key}</span>
+                    <span style={{ color:C.dim }}>{t.sets}×{reps}{t.w!=null ? ` · ${t.w}kg${it.est?"*":""}` : ""}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+          <div style={{ fontSize:11, color:C.dim, margin:"6px 4px" }}>* estimated starting load — confirm/adjust on first session. Set counts shown are week 1; they ramp up each week.</div>
+          <button onClick={() => onInstall(preview.prog)} style={{ ...btn(C.acc, "#04150E"), marginTop:6 }}>Use this program</button>
+        </div>
+      )}
+
+      {current && current.meso && !options && (
+        <div style={{ ...card, borderColor:C.line }}>
+          <div style={{ fontSize:12, color:C.dim }}>Current program is a generated mesocycle ({current.meso.splitName}, week {current.meso.week}/{current.meso.totalWeeks}). Generating a new one will replace it. Logged sessions are kept.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+function StatIn({ label, val, onChange, wide }) {
+  return (
+    <div style={{ flex: wide ? "0 0 50%" : 1 }}>
+      <label style={{ fontSize:10, color:C.dim, display:"block", marginBottom:3 }}>{label}</label>
+      <input style={{ ...inp }} inputMode="decimal" value={val} placeholder="—" onChange={e => onChange(e.target.value)} />
+    </div>
+  );
+}
+
+/* ============================================================
    Program editor — drag reorder of exercises within a day
    ============================================================ */
-function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, removeCustom, exportJson, importJson, onReset }) {
+function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, removeCustom, exportJson, importJson, onReset, onAdvanceWeek, onExitMeso }) {
   const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmExit, setConfirmExit] = useState(false);
+  const st = mesoStatus(program);
   const addDay = () => setProgram({ ...program, days: [...program.days, { id: uid(), name:"New day", items: [] }] });
   const rmDay = id => setProgram({ ...program, days: program.days.filter(d => d.id !== id) });
   const rename = (id, name) => setProgram({ ...program, days: program.days.map(d => d.id===id ? { ...d, name } : d) });
@@ -834,6 +1013,37 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
 
   return (
     <div>
+      {st && (
+        <div style={{ ...card, borderColor: st.isDeload ? C.gold : C.acc }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+            <div>
+              <div style={{ fontSize:14, fontWeight:700, color: st.isDeload ? C.gold : C.acc }}>{st.label}</div>
+              <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{st.splitName} · {st.goalLabel} · RIR {st.rir.lo}–{st.rir.hi}</div>
+            </div>
+            <div style={{ fontSize:11, color:C.dim, textAlign:"right" }}>{st.accumWeeks} accum<br/>+1 deload</div>
+          </div>
+          {(st.cardio || st.nutrition) && (
+            <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${C.line}`, fontSize:12, color:C.dim, lineHeight:1.5 }}>
+              {st.cardio && <div>Cardio: {st.cardio.note}</div>}
+              {st.nutrition && <div>Calories: {st.nutrition.cal} · Protein: {st.nutrition.protein}</div>}
+            </div>
+          )}
+          <div style={{ display:"flex", gap:10, marginTop:12 }}>
+            <button onClick={onAdvanceWeek} disabled={st.week >= st.total}
+              style={{ ...btn(st.week >= st.total ? C.panel2 : C.acc, st.week >= st.total ? C.dim : "#04150E"), opacity: st.week >= st.total ? 0.6 : 1 }}>
+              {st.week >= st.total ? "Mesocycle complete" : st.week + 1 > st.accumWeeks ? "Advance → deload" : `Advance → week ${st.week + 1}`}
+            </button>
+          </div>
+          {!confirmExit
+            ? <button onClick={() => setConfirmExit(true)} style={{ ...btn("transparent", C.dim), border:`1px solid ${C.line}`, marginTop:8 }}>End mesocycle (keep as editable)</button>
+            : <div style={{ marginTop:8, display:"flex", gap:10 }}>
+                <button onClick={() => setConfirmExit(false)} style={btn(C.panel2, C.dim)}>Cancel</button>
+                <button onClick={() => { onExitMeso(); setConfirmExit(false); }} style={btn(C.gold, "#1A1206")}>End it</button>
+              </div>}
+          <div style={{ fontSize:10, color:C.dim, marginTop:8 }}>Advancing recomputes set counts (volume ramp) and the RIR target. Your logged/edited weights are kept — load progression runs per-session.</div>
+        </div>
+      )}
+
       <div style={{ ...card, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
         <div><div style={{ fontSize:13, fontWeight:600 }}>Weekly target</div><div style={{ fontSize:11, color:C.dim }}>sessions per week</div></div>
         <input style={{ ...inp, width:60 }} inputMode="numeric" value={program.target} onChange={e => setProgram({ ...program, target: Number(e.target.value)||0 })} />
