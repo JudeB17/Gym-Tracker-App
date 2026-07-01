@@ -15,7 +15,7 @@ const C = {
   warn: "#E56B6B", knee: "#E56B6B", gold: "#E5B86B"
 };
 const card = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14, marginTop: 12 };
-const inp = { background: C.bg, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 8, padding: "8px 10px", fontSize: 15, width: "100%", textAlign: "center", outline: "none" };
+const inp = { background: C.bg, color: C.ink, border: `1px solid ${C.line}`, borderRadius: 8, padding: "8px 10px", fontSize: 16, width: "100%", textAlign: "center", outline: "none" };
 const btn = (bg, fg) => ({ background: bg, color: fg, border: "none", borderRadius: 10, padding: "11px 14px", fontSize: 14, fontWeight: 600, width: "100%", cursor: "pointer" });
 const T_LABEL = { wr: "weight×reps", rep: "reps", time: "hold", wd: "load+dist", cardio: "cardio" };
 
@@ -23,8 +23,25 @@ const T_LABEL = { wr: "weight×reps", rep: "reps", time: "hold", wd: "load+dist"
 const uid = () => Math.random().toString(36).slice(2, 9);
 const TODAY = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const e1rm = (w, r) => (!w || !r) ? 0 : w * (1 + r / 30); // Epley
+const fmtDur = min => min == null ? "" : min >= 60 ? `${Math.floor(min/60)}h ${min%60}m` : `${min}m`;
+const fmtSec = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+const daysAgo = dateStr => {
+  const d = new Date(dateStr + "T00:00:00"), t = new Date(TODAY() + "T00:00:00");
+  return Math.round((t - d) / 86400000);
+};
+// best e1RM for an exercise key across sessions, optionally excluding one session id
+function bestE1rmBefore(sessions, key, excludeId) {
+  let best = 0;
+  sessions.forEach(s => {
+    if (s.id === excludeId) return;
+    const e = s.entries.find(x => x.key === key);
+    if (e && e.t === "wr") e.sets.forEach(x => { const v = e1rm(x.w, x.r); if (v > best) best = v; });
+  });
+  return best;
+}
 function blankSet(t) {
-  return { wr:{w:"",r:"",rpe:""}, rep:{r:"",rpe:""}, time:{sec:""}, wd:{w:"",dist:""}, cardio:{sec:"",dist:""} }[t];
+  const b = { wr:{w:"",r:"",rpe:""}, rep:{r:"",rpe:""}, time:{sec:""}, wd:{w:"",dist:""}, cardio:{sec:"",dist:""} }[t];
+  return { ...b, done: false };
 }
 function isoWeek(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
@@ -88,6 +105,14 @@ function App() {
 
   const saveProgram = useCallback(async p => { setProgram(p); await sSet("program:current", p); }, []);
 
+  /* ---- draft persistence: survive PWA kill / accidental close ---- */
+  const draftReady = useRef(false);
+  useEffect(() => {
+    if (!draftReady.current) return;
+    const t = setTimeout(() => { if (draft) sSet("draft:current", draft); }, 400);
+    return () => clearTimeout(t);
+  }, [draft]);
+
   /* ---- initial load with watchdog ---- */
   useEffect(() => {
     let done = false;
@@ -113,11 +138,14 @@ function App() {
         const out = [];
         for (const id of idx) { const s = await sGet(`session:${id}`); if (s) out.push(migrateSession(s)); }
         setSessions(out);
+        // resume an in-progress session if the app was killed mid-log
+        const savedDraft = await sGet("draft:current");
+        if (savedDraft && savedDraft.entries) { setDraft(savedDraft); setTab("log"); }
       } catch (e) {
         setLoadErr((e && e.message) ? ("Load error: " + e.message) : ("Load error: " + String(e)));
         const p = defaultProgram();
         setProgram(p); setActiveDayId(p.days[0].id); setCustom([]); setSessions([]); setInjuries([]);
-      } finally { done = true; clearTimeout(watchdog); setLoading(false); }
+      } finally { done = true; clearTimeout(watchdog); setLoading(false); draftReady.current = true; }
     })();
     return () => clearTimeout(watchdog);
   }, []);
@@ -219,7 +247,7 @@ function App() {
     const day = program.days.find(d => d.id === activeDayId);
     if (!day) return;
     setDraft({
-      id: uid(), date: TODAY(), dayId: day.id, dayName: day.name, bodyweight: "", feel: null,
+      id: uid(), date: TODAY(), dayId: day.id, dayName: day.name, bodyweight: "", feel: null, startedAt: Date.now(),
       injuries: injuries.filter(i => !i.closed).map(i => ({ name: i.name, pain: 0, swelling: false, note: "" })),
       entries: day.items.map(it => {
         const ex = exByKey(it.key); if (!ex) return null;
@@ -264,6 +292,20 @@ function App() {
       })).filter(e => e.sets.length > 0 || e.note)
     };
     if (clean.entries.length === 0 && clean.injuries.length === 0) { flash("Nothing logged."); return; }
+    // duration: from live timer on new sessions, preserved on edits
+    clean.durationMin = draft.startedAt
+      ? Math.max(1, Math.round((Date.now() - draft.startedAt) / 60000))
+      : (draft.durationMin ?? null);
+    delete clean.startedAt;
+    // PR scan: any wr exercise whose best e1RM beats all prior history
+    let prCount = 0;
+    clean.entries.forEach(e => {
+      if (e.t !== "wr") return;
+      const best = Math.max(0, ...e.sets.map(s => e1rm(s.w, s.r)));
+      if (!best) return;
+      const prior = bestE1rmBefore(sessions, e.key, clean.id);
+      if (prior > 0 && best > prior) prCount++;
+    });
     const existingIdx = sessions.findIndex(s => s.id === clean.id);
     let next;
     if (existingIdx >= 0) {
@@ -274,8 +316,15 @@ function App() {
     setSessions(next);
     await sSet(`session:${clean.id}`, clean);
     await sSet("sessions:index", next.map(s => s.id));
-    setDraft(null); setTab("history"); flash(existingIdx >= 0 ? "Updated." : "Saved.");
+    await sDel("draft:current");
+    setDraft(null); setTab("history");
+    flash((existingIdx >= 0 ? "Updated." : "Saved.") + (prCount ? ` ${prCount} PR${prCount > 1 ? "s" : ""}.` : ""));
   }, [draft, sessions, flash]);
+
+  const discardDraft = useCallback(async () => {
+    await sDel("draft:current");
+    setDraft(null);
+  }, []);
 
   const deleteSession = useCallback(async id => {
     const next = sessions.filter(s => s.id !== id);
@@ -297,6 +346,7 @@ function App() {
     const draftFromSession = {
       id: session.id, date: session.date, dayId: session.dayId, dayName: session.dayName,
       bodyweight: toStr(session.bodyweight),
+      durationMin: session.durationMin ?? null,
       feel: session.feel == null ? null : session.feel,
       injuries: [...logged, ...extra],
       entries: session.entries.map(e => ({
@@ -392,12 +442,12 @@ function App() {
 
   return (
     <Shell>
-      <Header tab={tab} setTab={setTab} />
+      <TopBar program={program} />
       {errBanner}
-      <div style={{ padding: "0 14px 90px" }}>
+      <div style={{ padding: "0 14px 120px" }}>
         {tab === "log" && (
           draft
-            ? <DraftView draft={draft} setDraft={setDraft} onSave={saveSession} onDiscard={() => setDraft(null)}
+            ? <DraftView draft={draft} setDraft={setDraft} onSave={saveSession} onDiscard={discardDraft}
                 lastForExercise={lastForExercise} exByKey={exByKey}
                 onAddExercise={() => openPicker(k => { addExerciseToDraft(k); setPicker(null); })} />
             : <StartView program={program} activeDayId={activeDayId} setActiveDayId={setActiveDayId} onStart={startSession} sessions={sessions} />
@@ -407,9 +457,7 @@ function App() {
             ? <SessionDetail session={viewSession} onBack={() => setViewSession(null)} onDelete={deleteSession} onEdit={editSession} exByKey={exByKey} />
             : <HistoryList sessions={sessions} onOpen={setViewSession} />
         )}
-        {tab === "progress" && <Progress sessions={sessions} allEx={allEx} />}
-        {tab === "volume" && <VolumeTab sessions={sessions} exResolve={exByKey} />}
-        {tab === "trends" && <Trends sessions={sessions} />}
+        {tab === "trends" && <Trends sessions={sessions} allEx={allEx} exResolve={exByKey} />}
         {tab === "injury" && <InjuryTab injuries={injuries} saveInjuries={saveInjuries} sessions={sessions} />}
         {tab === "goals" && <GoalsTab onInstall={installGenerated} current={program} setTab={setTab} />}
         {tab === "program" && <ProgramEditor program={program} setProgram={saveProgram} exByKey={exByKey}
@@ -418,7 +466,8 @@ function App() {
           onAdvanceWeek={advanceWeek} onExitMeso={exitMeso} />}
       </div>
       {picker && <Picker custom={custom} onAddCustom={addCustom} onPick={picker.onPick} onClose={() => setPicker(null)} />}
-      {toast && <div style={{ position:"fixed", bottom:84, left:"50%", transform:"translateX(-50%)", background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:20, padding:"8px 18px", fontSize:13, zIndex:50 }}>{toast}</div>}
+      {toast && <div style={{ position:"fixed", bottom:"calc(76px + env(safe-area-inset-bottom))", left:"50%", transform:"translateX(-50%)", background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:20, padding:"8px 18px", fontSize:13, zIndex:70, whiteSpace:"nowrap" }}>{toast}</div>}
+      <BottomNav tab={tab} setTab={t => { setViewSession(null); setTab(t); }} logging={!!draft} />
     </Shell>
   );
 }
@@ -429,18 +478,56 @@ function App() {
 function Shell({ children }) {
   return <div style={{ maxWidth: 520, margin: "0 auto", minHeight: "100vh", background: C.bg, color: C.ink, fontFamily: "system-ui,-apple-system,sans-serif" }}>{children}</div>;
 }
-function Header({ tab, setTab }) {
-  const tabs = [["log","Log"],["history","History"],["progress","Progress"],["volume","Volume"],["trends","Trends"],["injury","Injury"],["goals","Goals"],["program","Program"]];
+function TopBar({ program }) {
+  const st = program ? mesoStatus(program) : null;
   return (
-    <div style={{ position:"sticky", top:0, zIndex:40, background:C.bg, borderBottom:`1px solid ${C.line}` }}>
-      <div style={{ padding:"14px 16px 8px", fontSize:20, fontWeight:800, letterSpacing:1 }}>GYM</div>
-      <div style={{ display:"flex", overflowX:"auto", gap:4, padding:"0 10px 8px" }}>
-        {tabs.map(([k, label]) => (
-          <button key={k} onClick={() => setTab(k)} style={{
-            background: tab===k ? C.panel2 : "transparent", color: tab===k ? C.acc : C.dim,
-            border: tab===k ? `1px solid ${C.line}` : "1px solid transparent",
-            borderRadius:8, padding:"6px 12px", fontSize:13, fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" }}>{label}</button>
-        ))}
+    <div style={{ position:"sticky", top:0, zIndex:40, background:"rgba(14,17,22,.92)", backdropFilter:"blur(8px)", WebkitBackdropFilter:"blur(8px)", borderBottom:`1px solid ${C.line}`,
+      display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 16px" }}>
+      <div style={{ fontSize:18, fontWeight:800, letterSpacing:1.5 }}>GYM<span style={{ color:C.acc }}>.</span></div>
+      {st && (
+        <div style={{ fontSize:11, fontWeight:700, color: st.isDeload ? C.gold : C.acc,
+          background:C.panel2, border:`1px solid ${C.line}`, borderRadius:14, padding:"4px 10px" }}>
+          {st.label} · RIR {st.rir.lo}–{st.rir.hi}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const NAV_ICONS = {
+  log: <path d="M3 9v6M6 6v12M18 6v12M21 9v6M6 12h12" />,
+  history: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" /></>,
+  trends: <path d="M3 17l5-5 4 4 8-9M20 7h-5M20 7v5" />,
+  injury: <path d="M12 4v16M4 12h16" />,
+  goals: <><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="4.5" /><circle cx="12" cy="12" r="0.8" fill="currentColor" /></>,
+  program: <path d="M4 6h16M4 12h16M4 18h10" />
+};
+function NavIcon({ k }) {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      {NAV_ICONS[k]}
+    </svg>
+  );
+}
+function BottomNav({ tab, setTab, logging }) {
+  const tabs = [["log","Log"],["history","History"],["trends","Trends"],["injury","Injury"],["goals","Goals"],["program","Program"]];
+  return (
+    <div style={{ position:"fixed", bottom:0, left:0, right:0, zIndex:50, display:"flex", justifyContent:"center",
+      background:"rgba(21,26,33,.96)", backdropFilter:"blur(10px)", WebkitBackdropFilter:"blur(10px)", borderTop:`1px solid ${C.line}` }}>
+      <div style={{ display:"flex", width:"100%", maxWidth:520, paddingBottom:"env(safe-area-inset-bottom)" }}>
+        {tabs.map(([k, label]) => {
+          const on = tab === k;
+          return (
+            <button key={k} onClick={() => setTab(k)} style={{
+              flex:1, background:"transparent", border:"none", cursor:"pointer",
+              color: on ? C.acc : C.dim, padding:"8px 0 7px",
+              display:"flex", flexDirection:"column", alignItems:"center", gap:2, position:"relative" }}>
+              {k === "log" && logging && !on && <span style={{ position:"absolute", top:6, right:"calc(50% - 16px)", width:6, height:6, borderRadius:3, background:C.acc, animation:"pulse 1.6s infinite" }} />}
+              <NavIcon k={k} />
+              <span style={{ fontSize:9, fontWeight: on ? 700 : 500, letterSpacing:0.2 }}>{label}</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -454,6 +541,12 @@ function StartView({ program, activeDayId, setActiveDayId, onStart, sessions }) 
   const thisWeek = isoWeek(TODAY());
   const doneThisWeek = sessions.filter(s => isoWeek(s.date) === thisWeek).length;
   const st = mesoStatus(program);
+  const lastByDay = useMemo(() => {
+    const m = {};
+    sessions.forEach(s => { if (s.dayId && (!m[s.dayId] || s.date > m[s.dayId])) m[s.dayId] = s.date; });
+    return m;
+  }, [sessions]);
+  const pct = program.target > 0 ? Math.min(100, (doneThisWeek / program.target) * 100) : 0;
   return (
     <div>
       {st && (
@@ -468,23 +561,35 @@ function StartView({ program, activeDayId, setActiveDayId, onStart, sessions }) 
           </div>
         </div>
       )}
-      <div style={{ ...card, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-        <div><div style={{ fontSize:13, color:C.dim }}>This week</div>
-          <div style={{ fontSize:22, fontWeight:700 }}>{doneThisWeek}<span style={{ fontSize:14, color:C.dim }}> / {program.target}</span></div></div>
-        <div style={{ fontSize:11, color:C.dim, textAlign:"right" }}>sessions logged<br/>vs weekly target</div>
+      <div style={{ ...card }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div><div style={{ fontSize:13, color:C.dim }}>This week</div>
+            <div style={{ fontSize:22, fontWeight:700 }}>{doneThisWeek}<span style={{ fontSize:14, color:C.dim }}> / {program.target}</span></div></div>
+          <div style={{ fontSize:11, color:C.dim, textAlign:"right" }}>sessions logged<br/>vs weekly target</div>
+        </div>
+        <div style={{ height:6, background:C.bg, border:`1px solid ${C.line}`, borderRadius:3, overflow:"hidden", marginTop:10 }}>
+          <div style={{ height:"100%", width:`${pct}%`, background: pct >= 100 ? C.acc : C.blue, transition:"width .3s" }} />
+        </div>
       </div>
       <div style={{ ...card }}>
         <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Start a session</div>
-        {program.days.map(d => (
-          <button key={d.id} onClick={() => setActiveDayId(d.id)} style={{
-            display:"flex", justifyContent:"space-between", alignItems:"center", width:"100%",
-            background: activeDayId===d.id ? C.panel2 : C.bg, color:C.ink,
-            border:`1px solid ${activeDayId===d.id ? C.acc : C.line}`, borderRadius:10, padding:"12px 14px",
-            marginBottom:8, cursor:"pointer", textAlign:"left" }}>
-            <span style={{ fontWeight:600 }}>{d.name}</span>
-            <span style={{ fontSize:11, color:C.dim }}>{d.items.length} exercises</span>
-          </button>
-        ))}
+        {program.days.map(d => {
+          const last = lastByDay[d.id];
+          const ago = last != null ? daysAgo(last) : null;
+          return (
+            <button key={d.id} onClick={() => setActiveDayId(d.id)} style={{
+              display:"flex", justifyContent:"space-between", alignItems:"center", width:"100%",
+              background: activeDayId===d.id ? C.panel2 : C.bg, color:C.ink,
+              border:`1px solid ${activeDayId===d.id ? C.acc : C.line}`, borderRadius:10, padding:"12px 14px",
+              marginBottom:8, cursor:"pointer", textAlign:"left" }}>
+              <span style={{ fontWeight:600 }}>{d.name}</span>
+              <span style={{ fontSize:11, color:C.dim, textAlign:"right" }}>
+                {d.items.length} exercises
+                {ago != null && <><br/>{ago === 0 ? "done today" : `last ${ago}d ago`}</>}
+              </span>
+            </button>
+          );
+        })}
         <button onClick={onStart} style={{ ...btn(C.acc, "#04150E"), marginTop:6 }}>Begin {program.days.find(d=>d.id===activeDayId)?.name || ""}</button>
       </div>
     </div>
@@ -508,19 +613,60 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
     const [x] = a.splice(from, 1); a.splice(to, 0, x); return { ...d, entries: a };
   });
 
+  /* elapsed session clock (only for live sessions, not edits) */
+  const [nowTick, setNowTick] = useState(Date.now());
+  useEffect(() => {
+    if (!draft.startedAt) return;
+    const t = setInterval(() => setNowTick(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, [draft.startedAt]);
+  const elapsedMin = draft.startedAt ? Math.max(0, Math.round((nowTick - draft.startedAt) / 60000)) : null;
+
+  /* rest timer: fires when a set is marked done. length pref persisted. */
+  const [restLen, setRestLen] = useState(120); // 0 = off
+  const [restEnd, setRestEnd] = useState(null);
+  const restLenRef = useRef(120);
+  useEffect(() => { restLenRef.current = restLen; }, [restLen]);
+  useEffect(() => { (async () => { const v = await sGet("prefs:restLen"); if (v != null) setRestLen(v); })(); }, []);
+  const cycleRest = () => {
+    const order = [0, 90, 120, 180];
+    const next = order[(order.indexOf(restLen) + 1) % order.length];
+    setRestLen(next); sSet("prefs:restLen", next);
+    if (next === 0) setRestEnd(null);
+  };
+  const startRest = useCallback(() => {
+    if (restLenRef.current > 0) setRestEnd(Date.now() + restLenRef.current * 1000);
+  }, []);
+
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const totalSets = draft.entries.reduce((a, e) => a + e.sets.length, 0);
+  const doneSets = draft.entries.reduce((a, e) => a + e.sets.filter(s => s.done).length, 0);
+
   return (
     <div>
-      <div style={{ ...card, display:"flex", gap:10, alignItems:"center" }}>
-        <div style={{ flex:1 }}>
-          <input style={{ ...inp, textAlign:"left", fontWeight:700, fontSize:16, padding:"4px 8px" }} value={draft.dayName}
-            onChange={e => setDraft(d => ({ ...d, dayName: e.target.value }))} />
-          <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{draft.date} · long-press ⠿ to reorder · rename above (program unchanged)</div>
+      <div style={{ ...card }}>
+        <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+          <div style={{ flex:1 }}>
+            <input style={{ ...inp, textAlign:"left", fontWeight:700, fontSize:16, padding:"4px 8px" }} value={draft.dayName}
+              onChange={e => setDraft(d => ({ ...d, dayName: e.target.value }))} />
+          </div>
+          <div style={{ width:110 }}>
+            <label style={{ fontSize:10, color:C.dim }}>bodyweight kg</label>
+            <input style={inp} inputMode="decimal" value={draft.bodyweight} placeholder="—"
+              onChange={e => setDraft(d => ({ ...d, bodyweight: e.target.value }))} />
+          </div>
         </div>
-        <div style={{ width:120 }}>
-          <label style={{ fontSize:10, color:C.dim }}>bodyweight kg</label>
-          <input style={inp} inputMode="decimal" value={draft.bodyweight} placeholder="—"
-            onChange={e => setDraft(d => ({ ...d, bodyweight: e.target.value }))} />
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:8 }}>
+          <div style={{ fontSize:11, color:C.dim }}>
+            {draft.date}
+            {elapsedMin != null && <> · <span style={{ color:C.ink, fontWeight:600 }}>{fmtDur(elapsedMin)}</span></>}
+            {totalSets > 0 && <> · {doneSets}/{totalSets} sets done</>}
+          </div>
+          <button onClick={cycleRest} style={{ background:C.bg, border:`1px solid ${C.line}`, color: restLen ? C.acc : C.dim, borderRadius:12, padding:"3px 10px", fontSize:11, fontWeight:600, cursor:"pointer" }}>
+            rest {restLen ? `${restLen}s` : "off"}
+          </button>
         </div>
+        <div style={{ fontSize:10, color:C.dim, marginTop:4 }}>tap a set number to mark it done · long-press ⠿ to reorder</div>
       </div>
 
       <DragList
@@ -528,7 +674,7 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
         keyOf={e => e.eid || e.key}
         onMove={moveEntry}
         render={(e, i, dragHandle) => (
-          <ExerciseCard entry={e} setEntry={setEntry} rmEntry={rmEntry} prev={lastForExercise(e.key)} ex={exByKey(e.key)} dragHandle={dragHandle} />
+          <ExerciseCard entry={e} setEntry={setEntry} rmEntry={rmEntry} prev={lastForExercise(e.key)} ex={exByKey(e.key)} dragHandle={dragHandle} onSetDone={startRest} />
         )}
       />
 
@@ -538,10 +684,48 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
 
       <DraftInjuries draft={draft} setDraft={setDraft} />
 
-      <div style={{ display:"flex", gap:10, marginTop:16 }}>
-        <button style={{ ...btn(C.panel2, C.dim), flex:"0 0 90px" }} onClick={onDiscard}>Discard</button>
-        <button style={btn(C.acc, "#04150E")} onClick={onSave}>Save session</button>
-      </div>
+      {!confirmDiscard ? (
+        <div style={{ display:"flex", gap:10, marginTop:16 }}>
+          <button style={{ ...btn(C.panel2, C.dim), flex:"0 0 90px" }} onClick={() => setConfirmDiscard(true)}>Discard</button>
+          <button style={btn(C.acc, "#04150E")} onClick={onSave}>Save session</button>
+        </div>
+      ) : (
+        <div style={{ ...card, borderColor:C.warn }}>
+          <div style={{ fontSize:13, marginBottom:10 }}>Discard this session? Everything entered will be lost.</div>
+          <div style={{ display:"flex", gap:10 }}>
+            <button onClick={() => setConfirmDiscard(false)} style={btn(C.panel2, C.dim)}>Keep logging</button>
+            <button onClick={onDiscard} style={btn(C.warn, "#1A0E0E")}>Discard</button>
+          </div>
+        </div>
+      )}
+
+      {restEnd && <RestPill endAt={restEnd} onExtend={() => setRestEnd(t => t + 30000)} onClear={() => setRestEnd(null)} />}
+    </div>
+  );
+}
+
+/* floating rest countdown, sits above the bottom nav */
+function RestPill({ endAt, onExtend, onClear }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 500); return () => clearInterval(t); }, []);
+  const rem = Math.max(0, Math.ceil((endAt - now) / 1000));
+  const finished = rem === 0;
+  const buzzed = useRef(false);
+  useEffect(() => {
+    if (finished && !buzzed.current) { buzzed.current = true; if (navigator.vibrate) navigator.vibrate([180, 80, 180]); }
+    if (!finished) buzzed.current = false;
+  }, [finished]);
+  return (
+    <div style={{ position:"fixed", bottom:"calc(64px + env(safe-area-inset-bottom))", left:"50%", transform:"translateX(-50%)",
+      display:"flex", alignItems:"center", gap:12, zIndex:60,
+      background: finished ? C.acc : C.panel2, color: finished ? "#04150E" : C.ink,
+      border:`1px solid ${finished ? C.acc : C.line}`, borderRadius:24, padding:"9px 16px",
+      boxShadow:"0 4px 16px rgba(0,0,0,.5)", animation: finished ? "pulse 1.2s infinite" : "none" }}>
+      <span style={{ fontSize:15, fontWeight:800, fontVariantNumeric:"tabular-nums", minWidth:44 }}>
+        {finished ? "GO" : fmtSec(rem)}
+      </span>
+      {!finished && <button onClick={onExtend} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.ink, borderRadius:12, padding:"2px 10px", fontSize:12, fontWeight:600, cursor:"pointer" }}>+30s</button>}
+      <button onClick={onClear} style={{ background:"transparent", border:"none", color:"inherit", fontSize:17, cursor:"pointer", padding:0, lineHeight:1 }}>×</button>
     </div>
   );
 }
@@ -603,60 +787,182 @@ function DragList({ items, keyOf, onMove, render }) {
   );
 }
 
-function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle }) {
+function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDone }) {
   const blank = blankSet(entry.t);
-  const addSet = () => setEntry(entry.eid, e => ({ ...e, sets: [...e.sets, { ...(e.sets[e.sets.length-1] || blank) }] }));
+  const [collapsed, setCollapsed] = useState(false);
+  const [plates, setPlates] = useState(false);
+  const addSet = () => setEntry(entry.eid, e => ({ ...e, sets: [...e.sets, { ...(e.sets[e.sets.length-1] || blank), done: false }] }));
   const rmSet = i => setEntry(entry.eid, e => ({ ...e, sets: e.sets.filter((_, j) => j !== i) }));
   const upd = (i, k, v) => setEntry(entry.eid, e => ({ ...e, sets: e.sets.map((s, j) => j===i ? { ...s, [k]: v } : s) }));
+  const toggleDone = i => {
+    const wasDone = !!entry.sets[i].done;
+    setEntry(entry.eid, e => ({ ...e, sets: e.sets.map((s, j) => j===i ? { ...s, done: !s.done } : s) }));
+    if (!wasDone && onSetDone) onSetDone();
+  };
   const setNote = v => setEntry(entry.eid, e => ({ ...e, note: v }));
+  // copy last session's actual values into the inputs (placeholders don't save)
+  const useLast = () => {
+    if (!prev || !prev.length) return;
+    const toStr = v => v == null ? "" : String(v);
+    setEntry(entry.eid, e => ({ ...e, sets: prev.map(s => {
+      if (e.t === "wr") return { w: toStr(s.w), r: toStr(s.r), rpe: toStr(s.rpe), done: false };
+      if (e.t === "rep") return { r: toStr(s.r), rpe: toStr(s.rpe), done: false };
+      if (e.t === "time") return { sec: toStr(s.sec), done: false };
+      if (e.t === "wd") return { w: toStr(s.w), dist: toStr(s.dist), done: false };
+      return { sec: toStr(s.sec), dist: toStr(s.dist), done: false };
+    }) }));
+  };
 
   const cols = { wr:["kg","reps","rpe"], rep:["reps","rpe"], time:["sec"], wd:["kg","dist m"], cardio:["min","dist km"] }[entry.t];
   const keys = { wr:["w","r","rpe"], rep:["r","rpe"], time:["sec"], wd:["w","dist"], cardio:["sec","dist"] }[entry.t];
-  const grid = `22px ${cols.map(() => "1fr").join(" ")} 24px`;
+  const grid = `30px ${cols.map(() => "1fr").join(" ")} 24px`;
   const hint = targetHint(entry.t, entry.target);
   const rp = rpHint(ex);
   const prevStr = prev ? prevSummary(entry.t, prev) : null;
+  const nDone = entry.sets.filter(s => s.done).length;
   const ph = k => {
-    // prefer the computed ghost (last session / overload / seed); fall back to target
-    if (k === "w" && entry.ghostW) return entry.ghostW;
-    if ((k === "r" || k === "sec") && entry.ghostR) return entry.ghostR;
-    const t = entry.target; if (!t) return "—";
-    if (k === "w") return t.w != null ? String(t.w) : "—";
-    if (k === "r") return t.repLo ? String(t.repLo) : "—";
+    // prefer the program GOAL (target); fall back to computed ghost
+    // (last session / overload estimate / seed) only when the goal is absent.
+    const t = entry.target;
+    if (k === "w") {
+      if (t && t.w != null) return String(t.w);   // goal weight
+      if (entry.ghostW) return entry.ghostW;       // overload estimate / seed
+      return "—";
+    }
+    if (k === "r") {
+      if (t && t.repLo != null) return String(t.repLo); // goal reps
+      if (entry.ghostR) return entry.ghostR;
+      return "—";
+    }
+    if (k === "sec") {
+      if (t && t.repLo != null) return String(t.repLo);
+      if (entry.ghostR) return entry.ghostR;
+      return "—";
+    }
     return "—";
+  };
+  // seed for the plate calculator: first typed weight, else placeholder weight
+  const plateSeed = () => {
+    if (entry.t !== "wr" && entry.t !== "wd") return "";
+    const typed = entry.sets.find(s => s.w !== "");
+    if (typed) return typed.w;
+    const p = ph("w");
+    return p === "—" ? "" : p;
   };
 
   return (
     <div style={card}>
       <div style={{ display:"flex", alignItems:"center", gap:4 }}>
         {dragHandle}
-        <div style={{ flex:1 }}>
+        <div style={{ flex:1, minWidth:0 }}>
           <div style={{ fontSize:14, fontWeight:600 }}>{entry.name} <span style={{ fontSize:10, color:C.dim, fontWeight:400 }}>· {T_LABEL[entry.t]}</span></div>
           <div style={{ display:"flex", gap:8, marginTop:2, flexWrap:"wrap" }}>
             {hint && <span style={{ fontSize:11, color:C.acc }}>{hint}</span>}
             {entry.est && (entry.ghostW || (entry.target && entry.target.w != null)) && <span style={{ fontSize:10, color:C.gold }}>est · confirm</span>}
             {rp && <span style={{ fontSize:11, color:C.dim }}>{rp}</span>}
           </div>
-          {prevStr && <div style={{ fontSize:10, color:C.dim, marginTop:2 }}>last: {prevStr}</div>}
+          {prevStr && (
+            <div style={{ display:"flex", gap:8, alignItems:"baseline", marginTop:3, flexWrap:"wrap" }}>
+              <span style={{ fontSize:11, color:C.blue, fontWeight:600 }}>last: {prevStr}</span>
+              <button onClick={useLast} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.blue, borderRadius:10, padding:"1px 8px", fontSize:10, fontWeight:600, cursor:"pointer" }}>use last</button>
+            </div>
+          )}
         </div>
+        <button onClick={() => setCollapsed(c => !c)} aria-label={collapsed ? "expand" : "collapse"}
+          style={{ background:"transparent", border:"none", color:C.dim, cursor:"pointer", fontSize:13, padding:"4px 6px", transform: collapsed ? "rotate(-90deg)" : "none", transition:"transform .15s" }}>▾</button>
         <button onClick={() => rmEntry(entry.eid)} style={{ background:"transparent", border:"none", color:C.dim, cursor:"pointer", fontSize:13 }}>remove</button>
       </div>
 
+      {collapsed ? (
+        <div style={{ fontSize:12, color: nDone === entry.sets.length && entry.sets.length > 0 ? C.acc : C.dim, marginTop:8 }}>
+          {nDone}/{entry.sets.length} sets done
+        </div>
+      ) : (
       <div style={{ marginTop:10 }}>
         <div style={{ display:"grid", gridTemplateColumns:grid, gap:6, fontSize:10, color:C.dim, marginBottom:4, textAlign:"center" }}>
           <span>#</span>{cols.map(c => <span key={c}>{c}</span>)}<span/>
         </div>
         {entry.sets.map((s, i) => (
-          <div key={i} style={{ display:"grid", gridTemplateColumns:grid, gap:6, marginBottom:6, alignItems:"center" }}>
-            <span style={{ fontSize:12, color:C.dim, textAlign:"center" }}>{i+1}</span>
-            {keys.map(k => <input key={k} style={inp} inputMode="decimal" value={s[k]} placeholder={ph(k)} onChange={e => upd(i, k, e.target.value)} />)}
+          <div key={i} style={{ display:"grid", gridTemplateColumns:grid, gap:6, marginBottom:6, alignItems:"center", opacity: s.done ? 0.65 : 1 }}>
+            <button onClick={() => toggleDone(i)} aria-label={s.done ? "mark set not done" : "mark set done"} style={{
+              width:28, height:28, borderRadius:14, cursor:"pointer", fontSize:12, fontWeight:700, padding:0,
+              background: s.done ? C.acc : "transparent", color: s.done ? "#04150E" : C.dim,
+              border:`1px solid ${s.done ? C.acc : C.line}` }}>
+              {s.done ? "✓" : i+1}
+            </button>
+            {keys.map(k => <input key={k} style={inp} inputMode="decimal" enterKeyHint="next" value={s[k]} placeholder={ph(k)}
+              onFocus={ev => ev.target.select()} onChange={ev => upd(i, k, ev.target.value)} />)}
             <button onClick={() => rmSet(i)} style={{ background:"transparent", border:"none", color:C.dim, cursor:"pointer", fontSize:16 }}>×</button>
           </div>
         ))}
-        <button onClick={addSet} style={{ background:"transparent", border:`1px dashed ${C.line}`, color:C.acc, borderRadius:8, padding:"6px 0", fontSize:12, width:"100%", cursor:"pointer" }}>+ set</button>
-      </div>
+        <div style={{ display:"flex", gap:6 }}>
+          <button onClick={addSet} style={{ background:"transparent", border:`1px dashed ${C.line}`, color:C.acc, borderRadius:8, padding:"6px 0", fontSize:12, flex:1, cursor:"pointer" }}>+ set</button>
+          {(entry.t === "wr" || entry.t === "wd") && (
+            <button onClick={() => setPlates(true)} style={{ background:"transparent", border:`1px dashed ${C.line}`, color:C.dim, borderRadius:8, padding:"6px 12px", fontSize:12, cursor:"pointer", whiteSpace:"nowrap" }}>plates</button>
+          )}
+        </div>
 
-      <input style={{ ...inp, textAlign:"left", marginTop:8, fontSize:13 }} value={entry.note || ""} placeholder="note (form cue, pain, tempo…)" onChange={e => setNote(e.target.value)} />
+        <input style={{ ...inp, textAlign:"left", marginTop:8, fontSize:14 }} value={entry.note || ""} placeholder="note (form cue, pain, tempo…)" onChange={e => setNote(e.target.value)} />
+      </div>
+      )}
+      {plates && <PlateCalc initial={plateSeed()} onClose={() => setPlates(false)} />}
+    </div>
+  );
+}
+
+/* per-side plate breakdown for barbell loading */
+function PlateCalc({ initial, onClose }) {
+  const [w, setW] = useState(initial || "");
+  const [bar, setBar] = useState(20);
+  const total = Number(w) || 0;
+  const perSide = (total - bar) / 2;
+  const PLATES = [25, 20, 15, 10, 5, 2.5, 1.25];
+  let rem = perSide, out = [];
+  if (perSide > 0) {
+    PLATES.forEach(p => { const n = Math.floor((rem + 1e-9) / p); if (n > 0) { out.push([p, n]); rem = Math.round((rem - n * p) * 100) / 100; } });
+  }
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.6)", zIndex:70, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }} onClick={onClose}>
+      <div style={{ background:C.panel, border:`1px solid ${C.line}`, borderRadius:14, padding:16, width:"100%", maxWidth:340 }} onClick={e => e.stopPropagation()}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+          <div style={{ fontSize:15, fontWeight:700 }}>Plate calculator</div>
+          <button onClick={onClose} style={{ background:"transparent", border:"none", color:C.dim, fontSize:20, cursor:"pointer" }}>×</button>
+        </div>
+        <div style={{ display:"flex", gap:8, alignItems:"flex-end" }}>
+          <div style={{ flex:1 }}>
+            <label style={{ fontSize:10, color:C.dim }}>total kg</label>
+            <input style={inp} inputMode="decimal" value={w} autoFocus onFocus={e => e.target.select()} onChange={e => setW(e.target.value)} />
+          </div>
+          <div style={{ flex:1 }}>
+            <label style={{ fontSize:10, color:C.dim }}>bar</label>
+            <div style={{ display:"flex", gap:4 }}>
+              {[20, 15].map(b => (
+                <button key={b} onClick={() => setBar(b)} style={{
+                  flex:1, background: bar===b ? C.panel2 : C.bg, color: bar===b ? C.acc : C.dim,
+                  border:`1px solid ${bar===b ? C.acc : C.line}`, borderRadius:8, padding:"8px 0", fontSize:14, fontWeight:600, cursor:"pointer" }}>{b}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div style={{ marginTop:14, minHeight:40 }}>
+          {total <= 0 ? <div style={{ fontSize:12, color:C.dim }}>Enter a weight.</div>
+          : total < bar ? <div style={{ fontSize:12, color:C.warn }}>Below bar weight.</div>
+          : perSide === 0 ? <div style={{ fontSize:13, color:C.acc, fontWeight:600 }}>Empty bar.</div>
+          : (
+            <>
+              <div style={{ fontSize:11, color:C.dim, marginBottom:6 }}>per side ({perSide} kg):</div>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                {out.map(([p, n]) => (
+                  <span key={p} style={{ background:C.panel2, border:`1px solid ${C.line}`, borderRadius:8, padding:"6px 10px", fontSize:13, fontWeight:700 }}>
+                    {p}<span style={{ color:C.dim, fontWeight:400, fontSize:11 }}> ×{n}</span>
+                  </span>
+                ))}
+              </div>
+              {rem > 0.01 && <div style={{ fontSize:11, color:C.gold, marginTop:6 }}>{rem} kg/side unloadable with standard plates — nearest is {Math.round((total - 2*rem)*100)/100} kg total.</div>}
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -733,26 +1039,48 @@ function DraftInjuries({ draft, setDraft }) {
    History — list of past sessions + read-only detail
    ============================================================ */
 function HistoryList({ sessions, onOpen }) {
+  const [q, setQ] = useState("");
   if (sessions.length === 0) return <Empty msg="No sessions logged yet. Start one from the Log tab." />;
-  const rev = sessions.slice().reverse();
+  const ql = q.trim().toLowerCase();
+  const rev = sessions.slice().reverse().filter(s =>
+    !ql || s.dayName.toLowerCase().includes(ql) || s.entries.some(e => e.name.toLowerCase().includes(ql)));
+  const thisWeek = isoWeek(TODAY());
+  // group by ISO week, newest first
+  const groups = [];
+  rev.forEach(s => {
+    const wk = isoWeek(s.date);
+    const g = groups[groups.length - 1];
+    if (g && g.wk === wk) g.items.push(s); else groups.push({ wk, items: [s] });
+  });
   return (
     <div>
-      {rev.map(s => {
-        const totalSets = s.entries.reduce((a, e) => a + e.sets.length, 0);
-        const vol = s.entries.reduce((a, e) => a + e.sets.reduce((b, x) => b + (x.w||0)*(x.r||0), 0), 0);
-        return (
-          <button key={s.id} onClick={() => onOpen(s)} style={{ ...card, width:"100%", textAlign:"left", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-            <div>
-              <div style={{ fontSize:14, fontWeight:600 }}>{s.dayName}</div>
-              <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{s.date} · {s.entries.length} exercises · {totalSets} sets</div>
-            </div>
-            <div style={{ textAlign:"right" }}>
-              {vol > 0 && <div style={{ fontSize:13, fontWeight:700, color:C.blue }}>{Math.round(vol).toLocaleString()}<span style={{ fontSize:10, color:C.dim }}> kg·r</span></div>}
+      <input style={{ ...inp, textAlign:"left", marginTop:12 }} value={q} placeholder="search day or exercise…" onChange={e => setQ(e.target.value)} />
+      {rev.length === 0 && <Empty msg="No matches." />}
+      {groups.map(g => (
+        <div key={g.wk}>
+          <div style={{ fontSize:11, color:C.dim, textTransform:"uppercase", letterSpacing:0.5, margin:"16px 4px 0" }}>
+            {g.wk === thisWeek ? "This week" : g.wk} · {g.items.length} session{g.items.length>1?"s":""}
+          </div>
+          {g.items.map(s => {
+            const totalSets = s.entries.reduce((a, e) => a + e.sets.length, 0);
+            const vol = s.entries.reduce((a, e) => a + e.sets.reduce((b, x) => b + (x.w||0)*(x.r||0), 0), 0);
+            return (
+              <button key={s.id} onClick={() => onOpen(s)} style={{ ...card, width:"100%", textAlign:"left", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <div>
+                  <div style={{ fontSize:14, fontWeight:600 }}>{s.dayName}</div>
+                  <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>
+                    {s.date} · {s.entries.length} exercises · {totalSets} sets{s.durationMin != null ? ` · ${fmtDur(s.durationMin)}` : ""}
+                  </div>
+                </div>
+                <div style={{ textAlign:"right" }}>
+                  {vol > 0 && <div style={{ fontSize:13, fontWeight:700, color:C.blue }}>{Math.round(vol).toLocaleString()}<span style={{ fontSize:10, color:C.dim }}> kg·r</span></div>}
               {(s.injuries||[]).length > 0 && <div style={{ fontSize:10, color:C.knee, marginTop:2 }}>{s.injuries.length} injury note{s.injuries.length>1?"s":""}</div>}
-            </div>
-          </button>
-        );
-      })}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -765,7 +1093,7 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey }) {
         <button onClick={onBack} style={{ background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 14px", fontSize:13, cursor:"pointer" }}>← Back</button>
         <div style={{ flex:1 }}>
           <div style={{ fontSize:16, fontWeight:700 }}>{session.dayName}</div>
-          <div style={{ fontSize:11, color:C.dim }}>{session.date}{session.bodyweight!=null ? ` · BW ${session.bodyweight}kg` : ""}{session.feel!=null ? ` · feel ${session.feel}/10` : ""}</div>
+          <div style={{ fontSize:11, color:C.dim }}>{session.date}{session.durationMin!=null ? ` · ${fmtDur(session.durationMin)}` : ""}{session.bodyweight!=null ? ` · BW ${session.bodyweight}kg` : ""}{session.feel!=null ? ` · feel ${session.feel}/10` : ""}</div>
         </div>
         <button onClick={() => onEdit(session)} style={{ background:C.panel2, color:C.acc, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 14px", fontSize:13, cursor:"pointer", whiteSpace:"nowrap" }}>Edit</button>
       </div>
@@ -822,70 +1150,107 @@ function setLine(t, s) {
 /* ============================================================
    Progress — per-exercise drill-down (any exercise)
    ============================================================ */
-function Progress({ sessions, allEx }) {
-  const exMap = useMemo(() => {
+// Build the {key,n,t} map for every exercise that has ever been logged,
+// falling back to session-embedded name/type for exercises no longer in the lib.
+function useExMap(sessions, allEx) {
+  return useMemo(() => {
     const m = new Map(); allEx.forEach(e => m.set(e.key, e));
-    sessions.forEach(s => s.entries.forEach(e => { if (!m.has(e.key)) m.set(e.key, { key:e.key, n:e.name, t:e.t }); }));
+    sessions.forEach(s => s.entries.forEach(e => { if (!m.has(e.key)) m.set(e.key, { key:e.key, n:e.name, t:e.t, m:LIB_BY_NAME.get(e.name) || null }); }));
     return m;
   }, [allEx, sessions]);
-  const logged = useMemo(() => {
-    const set = new Set(); sessions.forEach(s => s.entries.forEach(e => set.add(e.key)));
-    return [...set].map(k => exMap.get(k)).filter(Boolean).sort((a, b) => a.n.localeCompare(b.n));
-  }, [sessions, exMap]);
-  const [exKey, setExKey] = useState(null);
-  const picked = exKey ?? logged[0]?.key;
-  const ex = picked ? exMap.get(picked) : null;
+}
 
-  const history = useMemo(() => {
-    if (!ex) return [];
-    return sessions.map(s => {
-      const e = s.entries.find(x => x.key === picked);
-      if (!e || !e.sets.length) return null;
-      let metric = 0, label = "";
-      if (ex.t === "wr") { metric = Math.round(Math.max(...e.sets.map(x => e1rm(x.w, x.r)))); label = metric + " e1RM"; }
-      else if (ex.t === "rep") { metric = Math.max(...e.sets.map(x => x.r||0)); label = metric + " reps"; }
-      else if (ex.t === "time") { metric = Math.max(...e.sets.map(x => x.sec||0)); label = metric + "s"; }
-      else if (ex.t === "wd") { metric = Math.max(...e.sets.map(x => x.w||0)); label = metric + "kg"; }
-      else { metric = Math.round(e.sets.reduce((a, x) => a + (x.dist||0), 0)*10)/10; label = metric + "km"; }
-      return { date: s.date, metric, label, sets: e.sets, note: e.note, t: ex.t };
-    }).filter(Boolean);
-  }, [sessions, picked, ex]);
+// per-exercise session history + progression metric (shared by drill-down)
+function exerciseHistory(sessions, picked, ex) {
+  if (!ex) return [];
+  return sessions.map(s => {
+    const e = s.entries.find(x => x.key === picked);
+    if (!e || !e.sets.length) return null;
+    let metric = 0, label = "";
+    if (ex.t === "wr") { metric = Math.round(Math.max(...e.sets.map(x => e1rm(x.w, x.r)))); label = metric + " e1RM"; }
+    else if (ex.t === "rep") { metric = Math.max(...e.sets.map(x => x.r||0)); label = metric + " reps"; }
+    else if (ex.t === "time") { metric = Math.max(...e.sets.map(x => x.sec||0)); label = metric + "s"; }
+    else if (ex.t === "wd") { metric = Math.max(...e.sets.map(x => x.w||0)); label = metric + "kg"; }
+    else { metric = Math.round(e.sets.reduce((a, x) => a + (x.dist||0), 0)*10)/10; label = metric + "km"; }
+    return { date: s.date, metric, label, sets: e.sets, note: e.note, t: ex.t };
+  }).filter(Boolean);
+}
 
+/* per-exercise drill-down: chart + every session. Fixed exercise (no dropdown). */
+function ExerciseDetail({ sessions, exMap, exKey, onBack }) {
+  const ex = exMap.get(exKey);
+  const history = useMemo(() => exerciseHistory(sessions, exKey, ex), [sessions, exKey, ex]);
   const series = history.filter(h => h.metric > 0).map(h => ({ date: h.date, v: h.metric }));
   const unit = ex ? ({ wr:"kg e1RM", rep:"reps", time:"s", wd:"kg", cardio:"km" }[ex.t]) : "";
-
-  if (logged.length === 0) return <Empty msg="Log sessions and per-exercise progress appears here." />;
   const first = series[0]?.v, last = series[series.length-1]?.v;
   const delta = (first && last) ? Math.round((last - first) / first * 1000)/10 : null;
 
   return (
     <div>
-      <div style={{ ...card, display:"flex", gap:10, alignItems:"center" }}>
-        <select value={picked || ""} onChange={e => setExKey(e.target.value)} style={{ flex:1, background:C.bg, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 10px", fontSize:14 }}>
-          {logged.map(e => <option key={e.key} value={e.key}>{e.n}</option>)}
-        </select>
-      </div>
+      <DetailHeader title={ex ? ex.n : exKey} sub={ex ? T_LABEL[ex.t] : ""} onBack={onBack} />
       {series.length > 0 && (
         <Stat row={[
           ["Sessions", history.length],
-          ["Best", Math.max(...series.map(s => s.v)) + (unit==="kg e1RM" ? "" : "")],
+          ["Best", Math.max(...series.map(s => s.v))],
           ["Change", delta!=null ? (delta >= 0 ? "+" : "") + delta + "%" : "—"]
         ]} />
       )}
       <Line title="Progression" data={series} color={C.acc} unit={unit} />
       <div style={{ ...card }}>
         <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Every session</div>
-        {history.slice().reverse().map((h, i) => (
-          <div key={i} style={{ padding:"8px 0", borderBottom: i < history.length-1 ? `1px solid ${C.line}` : "none" }}>
-            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline" }}>
-              <span style={{ fontSize:13, fontWeight:600 }}>{h.date}</span>
-              <span style={{ fontSize:13, color:C.acc, fontWeight:700 }}>{h.label}</span>
+        {history.length === 0 && <div style={{ fontSize:12, color:C.dim }}>No sets logged yet.</div>}
+        {(() => {
+          // flag sessions where the metric set a new running max (skip the first — baseline, not a PR)
+          let runMax = -Infinity;
+          const withPr = history.map((h, i) => {
+            const pr = i > 0 && h.metric > runMax && h.metric > 0;
+            if (h.metric > runMax) runMax = h.metric;
+            return { ...h, pr };
+          });
+          return withPr.slice().reverse().map((h, i) => (
+            <div key={i} style={{ padding:"8px 0", borderBottom: i < history.length-1 ? `1px solid ${C.line}` : "none" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline" }}>
+                <span style={{ fontSize:13, fontWeight:600 }}>{h.date}
+                  {h.pr && <span style={{ marginLeft:8, fontSize:9, fontWeight:800, color:"#04150E", background:C.gold, borderRadius:6, padding:"2px 6px", verticalAlign:"middle", letterSpacing:0.5 }}>PR</span>}
+                </span>
+                <span style={{ fontSize:13, color:C.acc, fontWeight:700 }}>{h.label}</span>
+              </div>
+              <div style={{ fontSize:12, color:C.dim, marginTop:3 }}>{prevSummary(h.t, h.sets)}</div>
+              {h.note && <div style={{ fontSize:12, color:C.gold, marginTop:3, fontStyle:"italic" }}>“{h.note}”</div>}
             </div>
-            <div style={{ fontSize:12, color:C.dim, marginTop:3 }}>{prevSummary(h.t, h.sets)}</div>
-            {h.note && <div style={{ fontSize:12, color:C.gold, marginTop:3, fontStyle:"italic" }}>“{h.note}”</div>}
-          </div>
-        ))}
+          ));
+        })()}
       </div>
+    </div>
+  );
+}
+
+/* tappable list of every logged exercise -> opens ExerciseDetail */
+function ExerciseList({ sessions, exMap, onPick }) {
+  const logged = useMemo(() => {
+    const counts = new Map();
+    sessions.forEach(s => s.entries.forEach(e => {
+      const c = counts.get(e.key) || { key:e.key, sessions:0, last:"" };
+      c.sessions += 1; if (s.date > c.last) c.last = s.date;
+      counts.set(e.key, c);
+    }));
+    return [...counts.values()]
+      .map(c => ({ ...c, ex: exMap.get(c.key) }))
+      .filter(c => c.ex)
+      .sort((a, b) => a.ex.n.localeCompare(b.ex.n));
+  }, [sessions, exMap]);
+  if (logged.length === 0) return <Empty msg="Log sessions and per-exercise progress appears here." />;
+  return (
+    <div style={{ marginTop:12 }}>
+      {logged.map(c => (
+        <button key={c.key} onClick={() => onPick(c.key)} style={{ ...card, marginTop:0, marginBottom:8, width:"100%", textAlign:"left", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div>
+            <div style={{ fontSize:14, fontWeight:600 }}>{c.ex.n}</div>
+            <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{c.sessions} session{c.sessions>1?"s":""} · last {c.last}</div>
+          </div>
+          <span style={{ fontSize:18, color:C.dim }}>›</span>
+        </button>
+      ))}
     </div>
   );
 }
@@ -893,7 +1258,21 @@ function Progress({ sessions, allEx }) {
 /* ============================================================
    Trends — aggregate (volume / bodyweight / frequency)
    ============================================================ */
-function Trends({ sessions }) {
+// shared back-header for drill-down views
+function DetailHeader({ title, sub, onBack }) {
+  return (
+    <div style={{ display:"flex", gap:10, alignItems:"center", marginTop:12 }}>
+      <button onClick={onBack} style={{ background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 14px", fontSize:13, cursor:"pointer", whiteSpace:"nowrap" }}>← Back</button>
+      <div style={{ flex:1, minWidth:0 }}>
+        <div style={{ fontSize:16, fontWeight:700, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{title}</div>
+        {sub && <div style={{ fontSize:11, color:C.dim }}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* Aggregate overview: totals, volume, bodyweight, feel, sessions/week. */
+function TrendsOverview({ sessions }) {
   const weekCounts = useMemo(() => {
     const m = {}; sessions.forEach(s => { const w = isoWeek(s.date); m[w] = (m[w]||0)+1; });
     return Object.entries(m).sort();
@@ -901,7 +1280,6 @@ function Trends({ sessions }) {
   const volSeries = useMemo(() => sessions.map(s => ({ date:s.date, v: s.entries.reduce((a, e) => a + e.sets.reduce((b, x) => b + (x.w||0)*(x.r||0), 0), 0) })).filter(d => d.v > 0), [sessions]);
   const bwSeries = useMemo(() => sessions.filter(s => s.bodyweight != null).map(s => ({ date:s.date, v:s.bodyweight })), [sessions]);
   const feelSeries = useMemo(() => sessions.filter(s => s.feel != null).map(s => ({ date:s.date, v:s.feel })), [sessions]);
-  if (sessions.length === 0) return <Empty msg="Log sessions and trends appear here." />;
   return (
     <div>
       <Stat row={[["Sessions", sessions.length], ["Weeks active", weekCounts.length], ["Avg/wk", weekCounts.length ? (sessions.length/weekCounts.length).toFixed(1) : "0"]]} />
@@ -909,6 +1287,129 @@ function Trends({ sessions }) {
       {bwSeries.length > 0 && <Line title="Bodyweight" data={bwSeries} color={C.warn} unit="kg" />}
       {feelSeries.length > 0 && <Line title="Readiness / feel (1–10)" data={feelSeries} color={C.acc} unit="" />}
       <Bars title="Sessions per week" data={weekCounts} />
+    </div>
+  );
+}
+
+/* per-muscle weekly-sets trend + the sessions that hit that muscle. */
+function MuscleDetail({ sessions, muscle, exResolve, onBack, onPickExercise }) {
+  // weekly set totals for this muscle (chronological)
+  const weekSeries = useMemo(() => {
+    const byWeek = {};
+    sessions.forEach(s => {
+      let n = 0;
+      s.entries.forEach(e => { if (muscleOfEntry(e, exResolve) === muscle) n += (e.sets ? e.sets.length : 0); });
+      if (n > 0) { const w = isoWeek(s.date); byWeek[w] = (byWeek[w] || 0) + n; }
+    });
+    return Object.entries(byWeek).sort().map(([wk, v]) => ({ date: wk, v }));
+  }, [sessions, muscle, exResolve]);
+
+  // sessions that hit this muscle, newest first, with the exercises + set counts
+  const hitSessions = useMemo(() => {
+    return sessions.map(s => {
+      const items = s.entries
+        .filter(e => muscleOfEntry(e, exResolve) === muscle && e.sets && e.sets.length)
+        .map(e => ({ key:e.key, name:e.name, t:e.t, sets:e.sets }));
+      if (!items.length) return null;
+      const total = items.reduce((a, e) => a + e.sets.length, 0);
+      return { id:s.id, date:s.date, dayName:s.dayName, total, items };
+    }).filter(Boolean).sort((a, b) => a.date < b.date ? 1 : -1);
+  }, [sessions, muscle, exResolve]);
+
+  const lm = LANDMARKS[muscle];
+  return (
+    <div>
+      <DetailHeader title={muscle} sub={lm ? `MEV ${lm[1]} · MAV ${lm[2]} · MRV ${lm[3]} sets/wk` : "no landmark"} onBack={onBack} />
+      <Line title="Weekly sets" data={weekSeries} color={C.blue} unit="sets" />
+      <div style={{ ...card }}>
+        <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Previous workouts</div>
+        {hitSessions.length === 0 && <div style={{ fontSize:12, color:C.dim }}>No sets for this muscle yet.</div>}
+        {hitSessions.map((s, i) => (
+          <div key={s.id} style={{ padding:"8px 0", borderBottom: i < hitSessions.length-1 ? `1px solid ${C.line}` : "none" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline" }}>
+              <span style={{ fontSize:13, fontWeight:600 }}>{s.date} <span style={{ color:C.dim, fontWeight:400 }}>· {s.dayName}</span></span>
+              <span style={{ fontSize:13, color:C.acc, fontWeight:700 }}>{s.total} sets</span>
+            </div>
+            {s.items.map((e, j) => (
+              <button key={j} onClick={() => onPickExercise && onPickExercise(e.key)} style={{ display:"flex", justifyContent:"space-between", width:"100%", background:"transparent", border:"none", color:C.dim, cursor:"pointer", textAlign:"left", padding:"3px 0", fontSize:12 }}>
+                <span>{e.name}</span>
+                <span style={{ color:C.dim }}>{prevSummary(e.t, e.sets)}</span>
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* tappable muscle list -> MuscleDetail. only muscles with landmarks + logged sets. */
+function MuscleList({ sessions, exResolve, onPick }) {
+  const rows = useMemo(() => {
+    const counts = setsByMuscle(sessions, exResolve);
+    return MUSCLES
+      .filter(m => LANDMARKS[m] != null)
+      .map(m => ({ m, sets: counts[m] || 0 }))
+      .filter(r => r.sets > 0);
+  }, [sessions, exResolve]);
+  if (rows.length === 0) return <Empty msg="Log sessions and per-muscle trends appear here." />;
+  return (
+    <div style={{ marginTop:12 }}>
+      {rows.map(r => (
+        <button key={r.m} onClick={() => onPick(r.m)} style={{ ...card, marginTop:0, marginBottom:8, width:"100%", textAlign:"left", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+          <div style={{ fontSize:14, fontWeight:600 }}>{r.m}</div>
+          <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+            <span style={{ fontSize:12, color:C.dim }}>{r.sets} total sets</span>
+            <span style={{ fontSize:18, color:C.dim }}>›</span>
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* Trends — segmented: Overview / Exercises / Muscles, each with drill-downs.
+   Also keeps the current-week & trailing-4wk landmark view under Muscles. */
+function Trends({ sessions, allEx, exResolve }) {
+  const [view, setView] = useState("overview"); // overview | exercises | muscles
+  const [exKey, setExKey] = useState(null);      // exercise drill-down
+  const [muscle, setMuscle] = useState(null);    // muscle drill-down
+  const exMap = useExMap(sessions, allEx);
+
+  if (sessions.length === 0) return <Empty msg="Log sessions and trends appear here." />;
+
+  // drill-down overlays take over the whole tab
+  if (exKey) return <ExerciseDetail sessions={sessions} exMap={exMap} exKey={exKey} onBack={() => setExKey(null)} />;
+  if (muscle) return (
+    <MuscleDetail sessions={sessions} muscle={muscle} exResolve={exResolve}
+      onBack={() => setMuscle(null)}
+      onPickExercise={k => { setMuscle(null); setExKey(k); }} />
+  );
+
+  const seg = [["overview","Overview"],["exercises","Exercises"],["muscles","Muscles"]];
+  return (
+    <div>
+      <div style={{ display:"flex", gap:6, marginTop:12 }}>
+        {seg.map(([k, lbl]) => (
+          <button key={k} onClick={() => setView(k)} style={{
+            flex:1, background: view===k ? C.panel2 : C.bg, color: view===k ? C.acc : C.dim,
+            border:`1px solid ${view===k ? C.acc : C.line}`, borderRadius:8, padding:"9px 0", fontSize:13, fontWeight:600, cursor:"pointer" }}>{lbl}</button>
+        ))}
+      </div>
+      {view === "overview" && <TrendsOverview sessions={sessions} />}
+      {view === "exercises" && <ExerciseList sessions={sessions} exMap={exMap} onPick={setExKey} />}
+      {view === "muscles" && <MuscleVolumeSection sessions={sessions} exResolve={exResolve} onPickMuscle={setMuscle} />}
+    </div>
+  );
+}
+
+/* Muscles view: landmark bars (week / 4wk) on top, then tappable muscle list. */
+function MuscleVolumeSection({ sessions, exResolve, onPickMuscle }) {
+  return (
+    <div>
+      <VolumeTab sessions={sessions} exResolve={exResolve} />
+      <div style={{ fontSize:12, color:C.dim, margin:"18px 4px 0", textTransform:"uppercase", letterSpacing:0.5 }}>Tap a muscle for trend + history</div>
+      <MuscleList sessions={sessions} exResolve={exResolve} onPick={onPickMuscle} />
     </div>
   );
 }

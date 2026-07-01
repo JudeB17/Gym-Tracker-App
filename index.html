@@ -17,6 +17,20 @@
   #root{min-height:100vh;}
   body{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);}
   #err{display:none;color:#E56B6B;font-family:system-ui,sans-serif;padding:24px;font-size:15px;line-height:1.5;}
+
+  /* ---- interaction quality-of-life ---- */
+  button{-webkit-tap-highlight-color:transparent;touch-action:manipulation;}
+  button:active{opacity:.8;}
+  input,select,textarea{-webkit-tap-highlight-color:transparent;}
+  input:focus,select:focus,textarea:focus{border-color:#4DD6A6 !important;}
+  input::placeholder{color:#57616D;opacity:1;}
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0;}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:#2A323C;outline:none;}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:22px;height:22px;border-radius:50%;background:#4DD6A6;border:none;}
+  input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:#4DD6A6;border:none;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  @media (prefers-reduced-motion:reduce){*{transition:none !important;animation:none !important;}}
 </style>
 </head>
 <body>
