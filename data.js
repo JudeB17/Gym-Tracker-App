@@ -40,6 +40,10 @@
     ["Push-up","Chest","Bodyweight","rep","compound"],
     ["Deficit Push-up","Chest","Bodyweight","rep","compound"],
     ["Dips (Chest)","Chest","Bodyweight","rep","compound"],
+    ["Weighted Dip","Chest","Bodyweight","wr","compound"],
+    ["Floor Press","Chest","Barbell","wr","compound"],
+    ["Landmine Press","Chest","Barbell","wr","compound"],
+    ["Squeeze Press","Chest","Dumbbell","wr","iso"],
     // ---- Back ----
     ["Deadlift","Back","Barbell","wr","heavy"],
     ["Barbell Row","Back","Barbell","wr","heavy"],
@@ -59,6 +63,12 @@
     ["Rack Pull","Back","Barbell","wr","heavy"],
     ["Face Pull","Back","Cable","wr","small"],
     ["Machine Row","Back","Machine","wr","compound"],
+    ["Weighted Pull-up","Back","Bodyweight","wr","compound"],
+    ["Weighted Chin-up","Back","Bodyweight","wr","compound"],
+    ["Kroc Row","Back","Dumbbell","wr","compound"],
+    ["Single-Arm Pulldown","Back","Cable","wr","compound"],
+    ["Inverted Row","Back","Bodyweight","rep","compound"],
+    ["Back Extension","Back","Bodyweight","rep","iso"],
     // ---- Shoulders ----
     ["Overhead Press","Shoulders","Barbell","wr","heavy"],
     ["Push Press","Shoulders","Barbell","wr","compound"],
@@ -75,6 +85,9 @@
     ["Upright Row","Shoulders","Barbell","wr","iso"],
     ["Barbell Shrug","Shoulders","Barbell","wr","iso"],
     ["Dumbbell Shrug","Shoulders","Dumbbell","wr","iso"],
+    ["Landmine Shoulder Press","Shoulders","Barbell","wr","compound"],
+    ["Cable Rear Delt Fly","Shoulders","Cable","wr","small"],
+    ["Z Press","Shoulders","Barbell","wr","compound"],
     // ---- Quads ----
     ["Back Squat","Quads","Barbell","wr","heavy"],
     ["Front Squat","Quads","Barbell","wr","heavy"],
@@ -91,6 +104,10 @@
     ["Wall Sit","Quads","Bodyweight","time","rehab"],
     ["Spanish Squat (band)","Quads","Band","rep","rehab"],
     ["Terminal Knee Extension","Quads","Band","rep","rehab"],
+    ["Smith Machine Squat","Quads","Machine","wr","compound"],
+    ["Belt Squat","Quads","Machine","wr","compound"],
+    ["Reverse Lunge","Quads","Dumbbell","wr","compound"],
+    ["Safety Bar Squat","Quads","Barbell","wr","heavy"],
     // ---- Hamstrings ----
     ["Romanian Deadlift","Hamstrings","Barbell","wr","heavy"],
     ["Stiff-Leg Deadlift","Hamstrings","Barbell","wr","compound"],
@@ -101,6 +118,9 @@
     ["Single-Leg RDL","Hamstrings","Dumbbell","wr","compound"],
     ["Cable Pull-Through","Hamstrings","Cable","wr","iso"],
     ["Glute-Ham Raise","Hamstrings","Bodyweight","rep","iso"],
+    ["Deficit RDL","Hamstrings","Barbell","wr","compound"],
+    ["Kettlebell Swing","Hamstrings","Dumbbell","wr","compound"],
+    ["Reverse Hyperextension","Hamstrings","Machine","wr","iso"],
     // ---- Glutes ----
     ["Hip Thrust","Glutes","Barbell","wr","compound"],
     ["Machine Hip Thrust","Glutes","Machine","wr","compound"],
@@ -115,6 +135,8 @@
     ["Seated Calf Raise","Calves","Machine","wr","small"],
     ["Leg Press Calf Raise","Calves","Machine","wr","small"],
     ["Single-Leg Calf Raise","Calves","Bodyweight","rep","small"],
+    ["Smith Calf Raise","Calves","Machine","wr","small"],
+    ["Tibialis Raise","Calves","Bodyweight","rep","small"],
     // ---- Biceps ----
     ["Barbell Curl","Biceps","Barbell","wr","iso"],
     ["EZ-Bar Curl","Biceps","Barbell","wr","iso"],
@@ -126,6 +148,9 @@
     ["Cable Curl","Biceps","Cable","wr","iso"],
     ["Bayesian Cable Curl","Biceps","Cable","wr","iso"],
     ["Concentration Curl","Biceps","Dumbbell","wr","iso"],
+    ["Drag Curl","Biceps","Barbell","wr","iso"],
+    ["Zottman Curl","Biceps","Dumbbell","wr","iso"],
+    ["Cable Hammer Curl","Biceps","Cable","wr","iso"],
     // ---- Triceps ----
     ["Close-Grip Bench","Triceps","Barbell","wr","compound"],
     ["Skull Crusher","Triceps","Barbell","wr","iso"],
@@ -136,6 +161,9 @@
     ["DB Overhead Extension","Triceps","Dumbbell","wr","iso"],
     ["Dips (Triceps)","Triceps","Bodyweight","rep","compound"],
     ["Bench Dips","Triceps","Bodyweight","rep","iso"],
+    ["Cross-Body Extension","Triceps","Cable","wr","iso"],
+    ["Single-Arm Pushdown","Triceps","Cable","wr","iso"],
+    ["Machine Dip","Triceps","Machine","wr","compound"],
     // ---- Core ----
     ["Plank","Core","Bodyweight","time","small"],
     ["Side Plank","Core","Bodyweight","time","small"],
@@ -148,6 +176,10 @@
     ["Bird Dog","Core","Bodyweight","rep","rehab"],
     ["Hollow Hold","Core","Bodyweight","time","small"],
     ["Cable Woodchop","Core","Cable","wr","small"],
+    ["Machine Crunch","Core","Machine","wr","small"],
+    ["Decline Sit-up","Core","Bodyweight","rep","small"],
+    ["Suitcase Carry","Core","Dumbbell","wd","compound"],
+    ["L-Sit","Core","Bodyweight","time","small"],
     // ---- Forearms ----
     ["Wrist Curl","Forearms","Barbell","wr","small"],
     ["Reverse Wrist Curl","Forearms","Barbell","wr","small"],
@@ -164,6 +196,9 @@
     ["Assault Bike","Cardio","Machine","cardio","compound"],
     ["Ski Erg","Cardio","Machine","cardio","compound"],
     ["Sled Push","Cardio","Machine","wd","compound"],
+    ["Jump Rope","Cardio","Bodyweight","cardio","compound"],
+    ["Outdoor Run","Cardio","Bodyweight","cardio","compound"],
+    ["Swimming","Cardio","Bodyweight","cardio","compound"],
     // ---- Mobility / Rehab ----
     ["Stationary Bike (warm-up)","Mobility/Rehab","Machine","cardio","rehab"],
     ["Heel Slide","Mobility/Rehab","Bodyweight","rep","rehab"],
@@ -233,6 +268,75 @@
     if (w >= 20) return Math.round(w / 2) * 2;
     if (w >= 5)  return Math.round(w);
     return Math.round(w * 2) / 2;
+  }
+
+  /* ==========================================================
+     PROGRESSION ENGINE — double progression + per-set plans
+     ========================================================== */
+
+  /* smallest realistic load jump by equipment */
+  function incFor(equip, w) {
+    if (equip === "Dumbbell") return w >= 20 ? 2.5 : 2;      // DB rack jumps
+    if (equip === "Machine" || equip === "Cable") return w >= 40 ? 5 : 2.5; // stack pins
+    return 2.5;                                              // barbell: 1.25/side
+  }
+
+  /* Double-progression suggestion for weight×reps work.
+       prevSets  last session's logged sets [{w,r,...}]
+       ex        library row {e:equipment, role}
+       band      {repLo, repHi} — falls back to ex.rp
+       opts      { deload, nSets, workDown, fatigueMult }
+     Model: hold weight and add reps until every TOP-weight set hits the top
+     of the band, then bump the load and reset reps to the bottom of the band.
+     If workDown, sets after the first drop ~10% (heavy) / ~5% (compound) and
+     chase the top of the band instead.
+     Returns { topW, plan:[{w,r}], bumped, reason } or null (no usable history). */
+  function suggestNext(prevSets, ex, band, opts) {
+    opts = opts || {};
+    const repLo = (band && band.repLo) || (ex && ex.rp ? ex.rp[0] : 8);
+    const repHi = (band && band.repHi) || (ex && ex.rp ? ex.rp[1] : 12);
+    const nSets = Math.max(1, opts.nSets || (prevSets ? prevSets.length : 3));
+    const drop = opts.workDown === false ? 0
+               : (ex && ex.role === "heavy") ? 0.10
+               : (ex && ex.role === "compound") ? 0.05 : 0;
+    const equip = ex ? ex.e : "Barbell";
+
+    if (!prevSets || !prevSets.length) return null;
+    const maxW = Math.max(...prevSets.map(s => s.w || 0));
+    if (!(maxW > 0)) return null;
+    // working sets: within 10% of the heaviest (drops warm-ups, keeps back-offs)
+    const working = prevSets.filter(s => (s.w || 0) >= maxW * 0.90);
+    // top sets: at the heaviest weight — these alone decide the bump
+    const topSets = prevSets.filter(s => (s.w || 0) >= maxW * 0.999);
+
+    let topW = maxW, bumped = false, reason = "";
+    if (opts.deload) {
+      topW = roundLoad(maxW * 0.9) || maxW;
+      reason = "deload −10%";
+    } else if (topSets.length && topSets.every(s => (s.r || 0) >= repHi)) {
+      const inc = incFor(equip, maxW);
+      topW = roundLoad(maxW + inc) || (maxW + inc);
+      bumped = true;
+      reason = `▲ +${inc}kg — hit ${repHi}s across top sets`;
+    }
+    if (opts.fatigueMult && opts.fatigueMult < 1) topW = roundLoad(topW * opts.fatigueMult) || topW;
+
+    const backW = drop > 0 ? (roundLoad(topW * (1 - drop)) || topW) : topW;
+    const plan = [];
+    for (let i = 0; i < nSets; i++) {
+      const w = (i === 0 || drop === 0) ? topW : backW;
+      let r;
+      if (opts.deload || bumped) r = repLo;          // fresh weight / deload: bottom of band
+      else if (i > 0 && drop > 0) r = repHi;          // back-off sets chase the band top
+      else {
+        const prevR = working[Math.min(i, working.length - 1)];
+        const base = prevR ? (prevR.r || repLo) : repLo;
+        r = Math.min(repHi, Math.max(repLo, base + 1)); // +1 rep, capped at band top
+      }
+      plan.push({ w, r });
+    }
+    if (!bumped && !opts.deload) reason = `hold ${topW}kg — build reps to ${repHi}`;
+    return { topW, plan, bumped, reason };
   }
 
   /* --- Accessory seeding model.
@@ -315,7 +419,21 @@
     "Cable Woodchop": {bw:0.25},
     // forearms
     "Wrist Curl": {bw:0.25}, "Reverse Wrist Curl": {bw:0.15}, "Reverse Curl": {bw:0.22},
-    "Farmer's Carry": {bwHand:0.5}
+    "Farmer's Carry": {bwHand:0.5},
+    // new additions
+    "Weighted Dip": {bw:0.15}, "Floor Press": {lift:"BENCH", k:0.9},
+    "Landmine Press": {lift:"BENCH", k:0.5}, "Squeeze Press": {bwHand:0.15},
+    "Weighted Pull-up": {bw:0.10}, "Weighted Chin-up": {bw:0.12},
+    "Kroc Row": {lift:"DEAD", k:0.30, perHand:true}, "Single-Arm Pulldown": {bw:0.30},
+    "Landmine Shoulder Press": {lift:"BENCH", k:0.40}, "Cable Rear Delt Fly": {bw:0.08},
+    "Z Press": {lift:"BENCH", k:0.45},
+    "Smith Machine Squat": {lift:"SQUAT", k:0.90}, "Belt Squat": {lift:"SQUAT", k:1.0},
+    "Reverse Lunge": {bwHand:0.22}, "Safety Bar Squat": {lift:"SQUAT", k:0.85},
+    "Deficit RDL": {lift:"DEAD", k:0.65}, "Kettlebell Swing": {bwHand:0.25},
+    "Reverse Hyperextension": {bw:0.5}, "Smith Calf Raise": {bw:0.9},
+    "Drag Curl": {bw:0.28}, "Zottman Curl": {bwHand:0.10}, "Cable Hammer Curl": {bw:0.28},
+    "Cross-Body Extension": {bw:0.15}, "Single-Arm Pushdown": {bw:0.20}, "Machine Dip": {bw:0.8},
+    "Machine Crunch": {bw:0.5}, "Suitcase Carry": {bwHand:0.4}
   };
 
   /* Given the user's stats {bench,squat,dead,bodyweight} (working est-1RMs or
@@ -347,7 +465,8 @@
      ========================================================== */
 
   // pri = heavy compound (low reps), sec = compound, iso = isolation/small
-  const EX = (name, tier) => ({ name, tier });
+  // optional third arg overrides the tier's default rep band, e.g. EX("Back Squat","pri",[3,5])
+  const EX = (name, tier, reps) => ({ name, tier, reps });
 
   /* Day blueprints keyed by an id. muscles[] drives volume accounting. */
   const DAY = {
@@ -411,6 +530,30 @@
       EX("Barbell Bench Press","pri"), EX("Barbell Row","pri"),
       EX("Incline Dumbbell Press","sec"), EX("Lat Pulldown","sec"),
       EX("Cable Fly","iso"), EX("Straight-Arm Pulldown","iso") ] },
+    powerUpper: { name:"Upper (power)", muscles:["Chest","Back","Shoulders","Biceps","Triceps"], ex:[
+      EX("Barbell Bench Press","pri",[3,5]), EX("Barbell Row","pri",[3,5]),
+      EX("Overhead Press","sec",[5,8]), EX("Weighted Pull-up","sec",[5,8]),
+      EX("Barbell Curl","iso",[6,10]), EX("Skull Crusher","iso",[6,10]) ] },
+    powerLower: { name:"Lower (power)", muscles:["Quads","Hamstrings","Calves"], ex:[
+      EX("Back Squat","pri",[3,5]), EX("Deadlift","pri",[3,5]),
+      EX("Leg Press","sec",[8,12]), EX("Seated Leg Curl","iso",[8,12]),
+      EX("Standing Calf Raise","iso",[8,12]) ] },
+    hypUpper: { name:"Upper (hypertrophy)", muscles:["Chest","Back","Shoulders","Biceps","Triceps"], ex:[
+      EX("Incline Dumbbell Press","sec"), EX("Seated Cable Row","sec"),
+      EX("Cable Fly","iso"), EX("Lateral Raise","iso"),
+      EX("Incline DB Curl","iso"), EX("Rope Pushdown","iso") ] },
+    hypLower: { name:"Lower (hypertrophy)", muscles:["Quads","Hamstrings","Glutes","Calves"], ex:[
+      EX("Hack Squat","sec"), EX("Romanian Deadlift","sec"),
+      EX("Leg Extension","iso"), EX("Lying Leg Curl","iso"),
+      EX("Seated Calf Raise","iso") ] },
+    backShouldersHyp: { name:"Back & Shoulders (hyp)", muscles:["Back","Shoulders"], ex:[
+      EX("Chest-Supported Row","sec"), EX("Wide-Grip Pulldown","sec"),
+      EX("Straight-Arm Pulldown","iso"), EX("Machine Shoulder Press","sec"),
+      EX("Lateral Raise","iso"), EX("Rear Delt Fly","iso") ] },
+    chestArmsHyp: { name:"Chest & Arms (hyp)", muscles:["Chest","Biceps","Triceps"], ex:[
+      EX("Dumbbell Bench Press","sec"), EX("Incline Machine Press","sec"),
+      EX("Cable Fly","iso"), EX("EZ-Bar Curl","iso"),
+      EX("Hammer Curl","iso"), EX("Overhead Cable Extension","iso") ] },
     delts: { name:"Shoulders & Calves", muscles:["Shoulders","Calves"], ex:[
       EX("Overhead Press","pri"), EX("Lateral Raise","iso"),
       EX("Rear Delt Fly","iso"), EX("Cable Lateral Raise","iso"),
@@ -439,14 +582,23 @@
       blurb:"PPL once + an extra upper/lower. Hybrid 5-day.",
       seq:["pushHeavy","pullHeavy","legHeavy","upperVol","lowerVol"] },
     { id:"full4", name:"Full Body ×4", days:4, blurb:"Four whole-body sessions, rotated.",
-      seq:["fullA","fullB","fullC","fullA"] }
+      seq:["fullA","fullB","fullC","fullA"] },
+    { id:"phul4", name:"PHUL (Power + Hypertrophy U/L)", days:4,
+      blurb:"2 power days (3–5 reps) + 2 hypertrophy days. Strength and size in one week.",
+      seq:["powerUpper","powerLower","hypUpper","hypLower"] },
+    { id:"phat5", name:"PHAT (Power Hypertrophy Adaptive)", days:5,
+      blurb:"Norton-style: 2 power days + 3 body-part hypertrophy days.",
+      seq:["powerUpper","powerLower","backShouldersHyp","hypLower","chestArmsHyp"] },
+    { id:"pplu4", name:"Push / Pull / Legs / Upper", days:4,
+      blurb:"PPL once + an upper top-up. Chest, back and delts land 2×/week.",
+      seq:["pushHeavy","pullHeavy","legHeavy","upperVol"] }
   ];
 
   function splitsForDays(d) {
     // offer exact matches first, then anything that needs <= d days
     const exact = SPLITS.filter(s => s.days === d);
     const fewer = SPLITS.filter(s => s.days < d).sort((a,b)=>b.days-a.days);
-    return [...exact, ...fewer].slice(0, 4);
+    return [...exact, ...fewer].slice(0, 6);
   }
 
   /* ==========================================================
@@ -555,8 +707,9 @@
           const floor = exRef.tier === "pri" ? 3 : exRef.tier === "sec" ? 3 : 2;
           sets = Math.max(floor, Math.min(sets, 5)); // cap per-exercise sets
         }
-        // rep range from tier (heavy compounds low, iso high)
-        const [repLo, repHi] = exRef.tier === "pri" ? [5, 8]
+        // rep range: explicit blueprint override, else tier default
+        const [repLo, repHi] = exRef.reps ? exRef.reps
+                              : exRef.tier === "pri" ? [5, 8]
                               : exRef.tier === "sec" ? [8, 12]
                               : (lib.role === "small" ? [12, 20] : [10, 15]);
         const reps = Math.round((repLo + repHi) / 2);
@@ -595,12 +748,113 @@
     };
   }
 
+  /* ==========================================================
+     5/3/1 STRENGTH ENGINE (Wendler, Boring But Big template)
+     4 fixed days (Press / Deadlift / Bench / Squat). TM = 90% of 1RM.
+     3 working weeks + deload:
+       wk1 65/75/85% ×5,5,5+   wk2 70/80/90% ×3,3,3+
+       wk3 75/85/95% ×5,3,1+   wk4 40/50/60% ×5,5,5
+     Supplemental 5×10 @ 50% TM. Last main set is AMRAP (+).
+     ========================================================== */
+  const WAVE_531 = [
+    { pcts:[0.65,0.75,0.85], reps:[5,5,5], amrap:true,  label:"5s week" },
+    { pcts:[0.70,0.80,0.90], reps:[3,3,3], amrap:true,  label:"3s week" },
+    { pcts:[0.75,0.85,0.95], reps:[5,3,1], amrap:true,  label:"5/3/1 week" },
+    { pcts:[0.40,0.50,0.60], reps:[5,5,5], amrap:false, label:"deload" }
+  ];
+
+  function planFor531(tm, week) {
+    const w = WAVE_531[Math.max(0, Math.min(3, week - 1))];
+    return w.pcts.map((p, i) => ({
+      w: roundLoad(tm * p), r: w.reps[i], plus: w.amrap && i === 2
+    }));
+  }
+
+  const DAYS_531 = [
+    { name:"Press day", lift:"press", main:"Overhead Press", bbb:"Overhead Press", acc:[
+      ["Lat Pulldown", T(4,8,12,null)], ["Lateral Raise", T(3,12,15,null)], ["Face Pull", T(3,15,20,null)] ] },
+    { name:"Deadlift day", lift:"dead", main:"Deadlift", bbb:"Romanian Deadlift", acc:[
+      ["Barbell Row", T(4,8,12,null)], ["Hanging Leg Raise", T(3,10,15,null)] ] },
+    { name:"Bench day", lift:"bench", main:"Barbell Bench Press", bbb:"Barbell Bench Press", acc:[
+      ["Chest-Supported Row", T(4,8,12,null)], ["Incline Dumbbell Press", T(3,8,12,null)], ["Triceps Pushdown", T(3,10,15,null)] ] },
+    { name:"Squat day", lift:"squat", main:"Back Squat", bbb:"Back Squat", acc:[
+      ["Seated Leg Curl", T(3,10,15,null)], ["Standing Calf Raise", T(4,12,20,null)], ["Plank", T(3,0,0,null)] ] }
+  ];
+
+  function generate531(opts) {
+    const s = (opts && opts.stats) || {};
+    const tms = {
+      press: s.press ? roundLoad(s.press * 0.9) : null,
+      dead:  s.dead  ? roundLoad(s.dead  * 0.9) : null,
+      bench: s.bench ? roundLoad(s.bench * 0.9) : null,
+      squat: s.squat ? roundLoad(s.squat * 0.9) : null
+    };
+    const wave = WAVE_531[0];
+    const days = DAYS_531.map(bp => {
+      const tm = tms[bp.lift];
+      const mainLib = LIB_BY_NAME.get(bp.main);
+      const bbbLib = LIB_BY_NAME.get(bp.bbb);
+      const items = [];
+      const plan = tm ? planFor531(tm, 1) : null;
+      items.push({ key: mainLib.key, r531:"main", lift:bp.lift,
+        target:{ sets:3, repLo:wave.reps[0], repHi:wave.reps[0],
+                 w: plan ? plan[2].w : null, plan } });
+      const bbbW = tm ? roundLoad(tm * 0.5) : null;
+      items.push({ key: bbbLib.key, r531:"bbb", lift:bp.lift,
+        target:{ sets:5, repLo:10, repHi:10, w: bbbW } });
+      bp.acc.forEach(([n, t]) => {
+        const lib = LIB_BY_NAME.get(n); if (!lib) return;
+        let w = null, est = false;
+        if (lib.t === "wr") { const sd = seedWeight(n, Math.round((t.repLo + t.repHi) / 2), s); w = sd.w; est = sd.est; }
+        items.push({ key: lib.key, r531:"acc", target:{ ...t, w }, est });
+      });
+      return { id: uidLocal(), name: bp.name, items };
+    });
+    return {
+      target: 4, generated: true, days,
+      meso: {
+        type:"531", splitId:"531bbb", splitName:"5/3/1 Boring But Big",
+        goal:"strength", goalLabel:"Strength",
+        daysPerWeek:4, accumWeeks:3, totalWeeks:4, week:1, startedOn:null,
+        tms, waveLabel: wave.label,
+        stats:{ bench:s.bench||null, squat:s.squat||null, dead:s.dead||null,
+                press:s.press||null, bodyweight:s.bodyweight||null },
+        cardio:null, rir:null, nutrition:null
+      }
+    };
+  }
+
+  function applyWeek531(program, newWeek) {
+    const m = program.meso;
+    const week = Math.max(1, Math.min(newWeek, 4));
+    const isDeload = week === 4;
+    const wave = WAVE_531[week - 1];
+    const days = program.days.map(d => ({
+      ...d,
+      items: d.items.map(it => {
+        if (it.r531 === "main" && it.lift && m.tms && m.tms[it.lift]) {
+          const plan = planFor531(m.tms[it.lift], week);
+          return { ...it, target:{ ...it.target, repLo:wave.reps[0], repHi:wave.reps[0], w:plan[2].w, plan } };
+        }
+        if (it.r531 === "bbb" && it.lift && m.tms && m.tms[it.lift]) {
+          const tm = m.tms[it.lift];
+          return isDeload
+            ? { ...it, target:{ ...it.target, sets:3, repLo:5, repHi:5, w:roundLoad(tm * 0.4) } }
+            : { ...it, target:{ ...it.target, sets:5, repLo:10, repHi:10, w:roundLoad(tm * 0.5) } };
+        }
+        return it;
+      })
+    }));
+    return { ...program, days, meso:{ ...m, week, isDeload, waveLabel: wave.label } };
+  }
+
   /* Advance an existing generated program to a target week: recompute set
      counts (ramp) and RIR band; keep user-logged/edited weights intact.
      We DON'T overwrite weights here — load progression is handled per-session
      by app.js (effectiveTargetW). We only move SETS and RIR. */
   function applyWeek(program, newWeek) {
     if (!program || !program.meso) return program;
+    if (program.meso.type === "531") return applyWeek531(program, newWeek);
     const m = program.meso;
     const accumWeeks = m.accumWeeks;
     const goal = GOALS[m.goal] || GOALS.gain;
@@ -644,6 +898,16 @@
   function mesoStatus(program) {
     if (!program || !program.meso) return null;
     const m = program.meso;
+    if (m.type === "531") {
+      const wave = WAVE_531[Math.max(0, Math.min(3, m.week - 1))];
+      return {
+        week: m.week, total: 4, accumWeeks: 3,
+        isDeload: m.week === 4, rir: null, type: "531", tms: m.tms,
+        label: `5/3/1 · ${wave.label} (${m.week}/4)`,
+        splitName: m.splitName, goalLabel: m.goalLabel,
+        cardio: null, nutrition: null
+      };
+    }
     const isDeload = m.week > m.accumWeeks;
     return {
       week: m.week, total: m.totalWeeks, accumWeeks: m.accumWeeks,
@@ -720,6 +984,8 @@
     LANDMARKS, GOALS, SPLITS,
     splitsForDays, generateProgram, applyWeek, mesoStatus,
     rampSets, rirTarget, seedWeight, est1RM,
+    // progression + strength engine
+    suggestNext, incFor, generate531, WAVE_531,
     // volume landmark banding
     volumeBand
   };

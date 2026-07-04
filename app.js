@@ -5,7 +5,8 @@
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 const { MUSCLES, LIB, T, rpHint, defaultProgram,
         GOALS, SPLITS, splitsForDays, generateProgram, applyWeek, mesoStatus,
-        seedWeight, volumeBand, LANDMARKS } = window.GymData;
+        seedWeight, volumeBand, LANDMARKS,
+        suggestNext, incFor, generate531 } = window.GymData;
 const { sGet, sSet, sDel, available } = window.GymStore;
 
 /* ---------- theme ---------- */
@@ -98,6 +99,8 @@ function App() {
   const [viewSession, setViewSession] = useState(null); // read-only past session
   const [toast, setToast] = useState("");
   const [picker, setPicker] = useState(null);
+  const [gyms, setGyms] = useState([]);          // known gym names
+  const lastGym = useRef(null);                   // most recently used gym
 
   const flash = useCallback(m => { setToast(m); setTimeout(() => setToast(""), 1800); }, []);
   const allEx = useMemo(() => [...LIB, ...custom], [custom]);
@@ -134,6 +137,8 @@ function App() {
         setActiveDayId(p.days[0]?.id ?? null);
         setCustom((await sGet("library:custom")) || []);
         setInjuries((await sGet("injuries:list")) || []);
+        setGyms((await sGet("gyms:list")) || []);
+        lastGym.current = (await sGet("gyms:last")) || null;
         const idx = (await sGet("sessions:index")) || [];
         const out = [];
         for (const id of idx) { const s = await sGet(`session:${id}`); if (s) out.push(migrateSession(s)); }
@@ -185,76 +190,106 @@ function App() {
     return mesoStats.bodyweight || null;
   }, [sessions, mesoStats]);
 
-  const prefillFor = useCallback((key, target, exType, exName) => {
+  // program-level "work down" pref: back-off sets after the top set (default on)
+  const workDown = !program || program.workDown !== false;
+
+  /* opts.wrIndex: this exercise's position among weight exercises in the day.
+     Used ONLY to fatigue-discount seeded (no-history) weights — history-based
+     suggestions already embed where the exercise sits in the workout. */
+  const prefillFor = useCallback((key, target, exType, exName, opts) => {
     const t = target ? { ...target } : null;
+    const ex = exByKey(key);
     let ghostW = "", ghostR = "", est = false;
+    const nSets = (t && t.sets) || null;
+
+    // 1) fixed percent plan (5/3/1 main lifts) — authoritative, never overridden
+    if (t && t.plan && t.plan.length) {
+      const plan = t.plan.map(p => ({
+        w: p.w != null ? String(p.w) : "",
+        r: p.r != null ? String(p.r) + (p.plus ? "+" : "") : ""
+      }));
+      return { target: t, ghostW: plan[0].w, ghostR: plan[0].r, est: false, plan,
+               progNote: t.plan.map(p => p.w).join(" / ") + " kg" + (t.plan.some(p => p.plus) ? " · last set AMRAP" : "") };
+    }
 
     const prev = lastForExercise(key);
     if (prev && prev.length) {
-      // weight log: take the heaviest set as the working reference
-      if (exType === "wr" || exType === "wd") {
-        const ref = prev.reduce((a, s) => (s.w || 0) >= (a.w || 0) ? s : a, prev[0]);
-        let w = ref.w || 0;
-        ghostR = ref.r != null ? String(ref.r) : "";
-        if (t && t.w != null && !mesoDeload) {
-          // overload: bump only if every set last time met top of the rep band
-          const top = t.repHi || t.repLo || 0;
-          const allHit = prev.every(s => (s.r || 0) >= top && (s.w || 0) >= w * 0.999);
-          if (allHit && w > 0) {
-            const inc = w >= 60 ? 2.5 : w >= 20 ? 2 : 1;
-            w = Math.round((w + inc) * 2) / 2;
-          }
+      // 2) history → double progression with per-set plan
+      if (exType === "wr") {
+        const band = t ? { repLo: t.repLo, repHi: t.repHi } : null;
+        const sug = suggestNext(prev, ex, band, {
+          deload: mesoDeload, nSets: nSets || prev.length, workDown
+        });
+        if (sug) {
+          const plan = sug.plan.map(p => ({ w: String(p.w), r: String(p.r) }));
+          if (t) t.w = sug.topW;
+          return { target: t, ghostW: plan[0].w, ghostR: plan[0].r, est: false, plan, progNote: sug.reason };
         }
-        ghostW = w > 0 ? String(w) : "";
-        if (t) t.w = w > 0 ? w : t.w;
-      } else if (exType === "rep") {
+      }
+      if (exType === "wd") {
+        const ref = prev.reduce((a, s) => (s.w || 0) >= (a.w || 0) ? s : a, prev[0]);
+        ghostW = ref.w != null ? String(ref.w) : "";
+        return { target: t, ghostW, ghostR, est: false, plan: null, progNote: "" };
+      }
+      if (exType === "rep") {
         const ref = prev.reduce((a, s) => (s.r || 0) >= (a.r || 0) ? s : a, prev[0]);
-        ghostR = ref.r != null ? String(ref.r) : "";
-      } else if (exType === "time") {
+        const cap = (t && t.repHi) || null;
+        const next = (ref.r || 0) + 1;
+        ghostR = String(cap ? Math.min(next, cap) : next);
+        return { target: t, ghostW, ghostR, est: false, plan: null, progNote: ref.r ? `last ${ref.r} — try ${ghostR}` : "" };
+      }
+      if (exType === "time") {
         const ref = prev.reduce((a, s) => (s.sec || 0) >= (a.sec || 0) ? s : a, prev[0]);
         ghostR = ref.sec != null ? String(ref.sec) : "";
+        return { target: t, ghostW, ghostR, est: false, plan: null, progNote: "" };
       }
-      return { target: t, ghostW, ghostR, est: false };
+      return { target: t, ghostW, ghostR, est: false, plan: null, progNote: "" };
     }
 
-    // no history -> program target weight
+    // 3) no history -> program target weight
     if (t && t.w != null) {
       ghostW = String(t.w);
       ghostR = t.repLo != null ? String(t.repLo) : "";
-      return { target: t, ghostW, ghostR, est: !!(t && t._seeded) };
+      return { target: t, ghostW, ghostR, est: !!(t && t._seeded), plan: null, progNote: "" };
     }
 
-    // no history, no target weight -> population seed for library movements
+    // 4) no history, no target weight -> population seed, fatigue-discounted
+    //    by position in the workout (later exercises start a touch lighter)
     if ((exType === "wr") && exName) {
       const reps = (t && t.repLo) ? t.repLo : 8;
       const seeded = seedWeight(exName, reps, { ...mesoStats, bodyweight: lastBodyweight || mesoStats.bodyweight });
       if (seeded && seeded.w != null) {
-        ghostW = String(seeded.w);
+        const fat = Math.max(0.9, 1 - 0.025 * ((opts && opts.wrIndex) || 0));
+        const w = Math.round(seeded.w * fat * 2) / 2;
+        ghostW = String(w);
         ghostR = String(reps);
-        est = true;
-        if (t) t.w = seeded.w;
-        return { target: t, ghostW, ghostR, est };
+        if (t) t.w = w;
+        return { target: t, ghostW, ghostR, est: true, plan: null, progNote: "" };
       }
     }
 
     // fall through: reps ghost from target if present
     if (t && t.repLo != null) ghostR = String(t.repLo);
-    return { target: t, ghostW, ghostR, est };
-  }, [lastForExercise, mesoDeload, mesoStats, lastBodyweight]);
+    return { target: t, ghostW, ghostR, est, plan: null, progNote: "" };
+  }, [lastForExercise, mesoDeload, mesoStats, lastBodyweight, exByKey, workDown]);
 
   /* ---- session lifecycle ---- */
   const startSession = useCallback(() => {
     const day = program.days.find(d => d.id === activeDayId);
     if (!day) return;
+    let wrIndex = 0;
     setDraft({
       id: uid(), date: TODAY(), dayId: day.id, dayName: day.name, bodyweight: "", feel: null, startedAt: Date.now(),
+      gym: lastGym.current || null,
       injuries: injuries.filter(i => !i.closed).map(i => ({ name: i.name, pain: 0, swelling: false, note: "" })),
       entries: day.items.map(it => {
         const ex = exByKey(it.key); if (!ex) return null;
-        const pf = prefillFor(it.key, it.target, ex.t, ex.n);
+        const pf = prefillFor(it.key, it.target, ex.t, ex.n, { wrIndex });
+        if (ex.t === "wr") wrIndex++;
         const nSets = it.target?.sets || 1;
         return { eid: uid(), key: it.key, name: ex.n, t: ex.t, note: "",
           est: pf.est, target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR,
+          plan: pf.plan || null, progNote: pf.progNote || "",
           sets: Array.from({ length: nSets }, () => blankSet(ex.t)) };
       }).filter(Boolean)
     });
@@ -263,9 +298,15 @@ function App() {
 
   const addExerciseToDraft = useCallback(exKey => {
     const ex = exByKey(exKey); if (!ex) return;
-    const pf = prefillFor(exKey, null, ex.t, ex.n);
-    setDraft(d => ({ ...d, entries: [...d.entries, { eid: uid(), key: exKey, name: ex.n, t: ex.t, note: "",
-      target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR, est: pf.est, sets: [blankSet(ex.t)] }] }));
+    setDraft(d => {
+      const wrIndex = d.entries.filter(e => e.t === "wr").length;
+      const pf = prefillFor(exKey, null, ex.t, ex.n, { wrIndex });
+      const nSets = pf.plan ? pf.plan.length : 1;
+      return { ...d, entries: [...d.entries, { eid: uid(), key: exKey, name: ex.n, t: ex.t, note: "",
+        target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR, est: pf.est,
+        plan: pf.plan || null, progNote: pf.progNote || "",
+        sets: Array.from({ length: nSets }, () => blankSet(ex.t)) }] };
+    });
   }, [exByKey, prefillFor]);
 
   const saveSession = useCallback(async () => {
@@ -277,6 +318,7 @@ function App() {
     const num = v => v === "" ? 0 : Number(v) || 0;
     const clean = {
       ...draft,
+      gym: (draft.gym && String(draft.gym).trim()) || null,
       bodyweight: draft.bodyweight === "" ? null : Number(draft.bodyweight),
       feel: (draft.feel == null || draft.feel === "") ? null : Math.max(1, Math.min(10, Number(draft.feel))),
       injuries: (draft.injuries || []).filter(i => i.pain > 0 || i.swelling || i.note),
@@ -316,10 +358,17 @@ function App() {
     setSessions(next);
     await sSet(`session:${clean.id}`, clean);
     await sSet("sessions:index", next.map(s => s.id));
+    if (clean.gym) {
+      lastGym.current = clean.gym;
+      await sSet("gyms:last", clean.gym);
+      if (!gyms.includes(clean.gym)) {
+        const g = [...gyms, clean.gym]; setGyms(g); await sSet("gyms:list", g);
+      }
+    }
     await sDel("draft:current");
     setDraft(null); setTab("history");
     flash((existingIdx >= 0 ? "Updated." : "Saved.") + (prCount ? ` ${prCount} PR${prCount > 1 ? "s" : ""}.` : ""));
-  }, [draft, sessions, flash]);
+  }, [draft, sessions, gyms, flash]);
 
   const discardDraft = useCallback(async () => {
     await sDel("draft:current");
@@ -345,6 +394,7 @@ function App() {
       .map(i => ({ name: i.name, pain: 0, swelling: false, note: "" }));
     const draftFromSession = {
       id: session.id, date: session.date, dayId: session.dayId, dayName: session.dayName,
+      gym: session.gym || null,
       bodyweight: toStr(session.bodyweight),
       durationMin: session.durationMin ?? null,
       feel: session.feel == null ? null : session.feel,
@@ -378,18 +428,19 @@ function App() {
 
   /* ---- import/export ---- */
   const exportJson = useCallback(() => {
-    const data = { program, custom, sessions, injuries, exportedAt: new Date().toISOString() };
+    const data = { program, custom, sessions, injuries, gyms, exportedAt: new Date().toISOString() };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = `gym-backup-${TODAY()}.json`; a.click();
     URL.revokeObjectURL(a.href);
-  }, [program, custom, sessions, injuries]);
+  }, [program, custom, sessions, injuries, gyms]);
   const importJson = useCallback(async file => {
     try {
       const d = JSON.parse(await file.text());
       if (d.program && d.program.days) { const p = migrate(d.program); setProgram(p); setActiveDayId(p.days[0]?.id ?? null); await sSet("program:current", p); }
       if (Array.isArray(d.custom)) { setCustom(d.custom); await sSet("library:custom", d.custom); }
       if (Array.isArray(d.injuries)) { setInjuries(d.injuries); await sSet("injuries:list", d.injuries); }
+      if (Array.isArray(d.gyms)) { setGyms(d.gyms); await sSet("gyms:list", d.gyms); }
       if (Array.isArray(d.sessions)) {
         const migrated = d.sessions.map(migrateSession);
         setSessions(migrated);
@@ -429,7 +480,7 @@ function App() {
     flash("Mesocycle ended — program kept as editable.");
   }, [program, saveProgram, flash]);
 
-  const openPicker = useCallback(onPick => setPicker({ onPick }), []);
+  const openPicker = useCallback((onPick, initialQ) => setPicker({ onPick, initialQ: initialQ || "" }), []);
 
   if (loading) return <Shell><div style={{ color: C.dim, padding: 40, textAlign: "center" }}>Loading…</div></Shell>;
 
@@ -448,7 +499,7 @@ function App() {
         {tab === "log" && (
           draft
             ? <DraftView draft={draft} setDraft={setDraft} onSave={saveSession} onDiscard={discardDraft}
-                lastForExercise={lastForExercise} exByKey={exByKey}
+                lastForExercise={lastForExercise} exByKey={exByKey} gyms={gyms}
                 onAddExercise={() => openPicker(k => { addExerciseToDraft(k); setPicker(null); })} />
             : <StartView program={program} activeDayId={activeDayId} setActiveDayId={setActiveDayId} onStart={startSession} sessions={sessions} />
         )}
@@ -465,7 +516,7 @@ function App() {
           exportJson={exportJson} importJson={importJson} onReset={resetProgram}
           onAdvanceWeek={advanceWeek} onExitMeso={exitMeso} />}
       </div>
-      {picker && <Picker custom={custom} onAddCustom={addCustom} onPick={picker.onPick} onClose={() => setPicker(null)} />}
+      {picker && <Picker custom={custom} onAddCustom={addCustom} onPick={picker.onPick} initialQ={picker.initialQ} onClose={() => setPicker(null)} />}
       {toast && <div style={{ position:"fixed", bottom:"calc(76px + env(safe-area-inset-bottom))", left:"50%", transform:"translateX(-50%)", background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:20, padding:"8px 18px", fontSize:13, zIndex:70, whiteSpace:"nowrap" }}>{toast}</div>}
       <BottomNav tab={tab} setTab={t => { setViewSession(null); setTab(t); }} logging={!!draft} />
     </Shell>
@@ -487,7 +538,7 @@ function TopBar({ program }) {
       {st && (
         <div style={{ fontSize:11, fontWeight:700, color: st.isDeload ? C.gold : C.acc,
           background:C.panel2, border:`1px solid ${C.line}`, borderRadius:14, padding:"4px 10px" }}>
-          {st.label} · RIR {st.rir.lo}–{st.rir.hi}
+          {st.label}{st.rir ? ` · RIR ${st.rir.lo}–${st.rir.hi}` : ""}
         </div>
       )}
     </div>
@@ -556,8 +607,11 @@ function StartView({ program, activeDayId, setActiveDayId, onStart, sessions }) 
             <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{st.splitName} · {st.goalLabel}</div>
           </div>
           <div style={{ textAlign:"right" }}>
-            <div style={{ fontSize:18, fontWeight:700 }}>RIR {st.rir.lo}–{st.rir.hi}</div>
-            <div style={{ fontSize:10, color:C.dim }}>reps in reserve</div>
+            {st.rir
+              ? <><div style={{ fontSize:18, fontWeight:700 }}>RIR {st.rir.lo}–{st.rir.hi}</div>
+                  <div style={{ fontSize:10, color:C.dim }}>reps in reserve</div></>
+              : <><div style={{ fontSize:18, fontWeight:700 }}>{st.week}/{st.total}</div>
+                  <div style={{ fontSize:10, color:C.dim }}>week</div></>}
           </div>
         </div>
       )}
@@ -599,7 +653,7 @@ function StartView({ program, activeDayId, setActiveDayId, onStart, sessions }) 
 /* ============================================================
    Draft (logging) — with drag reorder + per-exercise notes
    ============================================================ */
-function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKey, onAddExercise }) {
+function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKey, onAddExercise, gyms }) {
   // ensure every entry has a stable id (handles drafts created before eid existed)
   useEffect(() => {
     if ((draft.entries || []).some(e => !e.eid)) {
@@ -666,6 +720,7 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
             rest {restLen ? `${restLen}s` : "off"}
           </button>
         </div>
+        <GymPicker gym={draft.gym} gyms={gyms || []} onSet={g => setDraft(d => ({ ...d, gym: g }))} />
         <div style={{ fontSize:10, color:C.dim, marginTop:4 }}>tap a set number to mark it done · long-press ⠿ to reorder</div>
       </div>
 
@@ -700,6 +755,40 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
       )}
 
       {restEnd && <RestPill endAt={restEnd} onExtend={() => setRestEnd(t => t + 30000)} onClear={() => setRestEnd(null)} />}
+    </div>
+  );
+}
+
+/* gym selector: chips for known gyms + inline add-new */
+function GymPicker({ gym, gyms, onSet }) {
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState("");
+  const chip = (on) => ({ background: on ? C.panel2 : "transparent", color: on ? C.acc : C.dim,
+    border:`1px solid ${on ? C.acc : C.line}`, borderRadius:12, padding:"4px 10px", fontSize:11,
+    fontWeight:600, cursor:"pointer", whiteSpace:"nowrap" });
+  const commit = () => {
+    const n = name.trim();
+    if (n) onSet(n);
+    setName(""); setAdding(false);
+  };
+  // show current gym even if it's not in the saved list yet
+  const list = gym && !gyms.includes(gym) ? [...gyms, gym] : gyms;
+  return (
+    <div style={{ marginTop:8 }}>
+      <div style={{ display:"flex", gap:6, alignItems:"center", overflowX:"auto", WebkitOverflowScrolling:"touch", paddingBottom:2 }}>
+        <span style={{ fontSize:10, color:C.dim, flexShrink:0 }}>gym</span>
+        <button onClick={() => onSet(null)} style={chip(!gym)}>none</button>
+        {list.map(g => <button key={g} onClick={() => onSet(g)} style={chip(gym === g)}>{g}</button>)}
+        {!adding && <button onClick={() => setAdding(true)} style={{ ...chip(false), borderStyle:"dashed" }}>+ new</button>}
+      </div>
+      {adding && (
+        <div style={{ display:"flex", gap:6, marginTop:6 }}>
+          <input style={{ ...inp, textAlign:"left", fontSize:13, padding:"6px 10px" }} value={name} autoFocus
+            placeholder="gym name" onChange={e => setName(e.target.value)} onKeyDown={e => e.key === "Enter" && commit()} />
+          <button onClick={commit} style={{ background:C.acc, color:"#04150E", border:"none", borderRadius:8, padding:"0 14px", fontSize:12, fontWeight:700, cursor:"pointer" }}>Add</button>
+          <button onClick={() => { setAdding(false); setName(""); }} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:8, padding:"0 10px", fontSize:12, cursor:"pointer" }}>×</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -820,23 +909,28 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
   const rp = rpHint(ex);
   const prevStr = prev ? prevSummary(entry.t, prev) : null;
   const nDone = entry.sets.filter(s => s.done).length;
-  const ph = k => {
-    // prefer the program GOAL (target); fall back to computed ghost
-    // (last session / overload estimate / seed) only when the goal is absent.
+  const ph = (k, i) => {
+    // per-set plan (double progression / 5/3/1 percents) wins; then program
+    // target; then computed ghost (last session / seed).
+    const p = entry.plan && entry.plan[i != null ? Math.min(i, entry.plan.length - 1) : 0];
+    if (p) {
+      if (k === "w" && p.w) return p.w;
+      if (k === "r" && p.r) return p.r;
+    }
     const t = entry.target;
     if (k === "w") {
-      if (t && t.w != null) return String(t.w);   // goal weight
-      if (entry.ghostW) return entry.ghostW;       // overload estimate / seed
+      if (entry.ghostW) return entry.ghostW;       // progression / seed
+      if (t && t.w != null) return String(t.w);    // goal weight
       return "—";
     }
     if (k === "r") {
-      if (t && t.repLo != null) return String(t.repLo); // goal reps
       if (entry.ghostR) return entry.ghostR;
+      if (t && t.repLo != null) return String(t.repLo);
       return "—";
     }
     if (k === "sec") {
-      if (t && t.repLo != null) return String(t.repLo);
       if (entry.ghostR) return entry.ghostR;
+      if (t && t.repLo != null) return String(t.repLo);
       return "—";
     }
     return "—";
@@ -846,7 +940,7 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
     if (entry.t !== "wr" && entry.t !== "wd") return "";
     const typed = entry.sets.find(s => s.w !== "");
     if (typed) return typed.w;
-    const p = ph("w");
+    const p = ph("w", 0);
     return p === "—" ? "" : p;
   };
 
@@ -858,6 +952,8 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
           <div style={{ fontSize:14, fontWeight:600 }}>{entry.name} <span style={{ fontSize:10, color:C.dim, fontWeight:400 }}>· {T_LABEL[entry.t]}</span></div>
           <div style={{ display:"flex", gap:8, marginTop:2, flexWrap:"wrap" }}>
             {hint && <span style={{ fontSize:11, color:C.acc }}>{hint}</span>}
+            {entry.progNote && <span style={{ fontSize:10, fontWeight:600,
+              color: entry.progNote.includes("▲") ? C.acc : entry.progNote.includes("deload") ? C.gold : C.dim }}>{entry.progNote}</span>}
             {entry.est && (entry.ghostW || (entry.target && entry.target.w != null)) && <span style={{ fontSize:10, color:C.gold }}>est · confirm</span>}
             {rp && <span style={{ fontSize:11, color:C.dim }}>{rp}</span>}
           </div>
@@ -890,7 +986,7 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
               border:`1px solid ${s.done ? C.acc : C.line}` }}>
               {s.done ? "✓" : i+1}
             </button>
-            {keys.map(k => <input key={k} style={inp} inputMode="decimal" enterKeyHint="next" value={s[k]} placeholder={ph(k)}
+            {keys.map(k => <input key={k} style={inp} inputMode="decimal" enterKeyHint="next" value={s[k]} placeholder={ph(k, i)}
               onFocus={ev => ev.target.select()} onChange={ev => upd(i, k, ev.target.value)} />)}
             <button onClick={() => rmSet(i)} style={{ background:"transparent", border:"none", color:C.dim, cursor:"pointer", fontSize:16 }}>×</button>
           </div>
@@ -1069,7 +1165,7 @@ function HistoryList({ sessions, onOpen }) {
                 <div>
                   <div style={{ fontSize:14, fontWeight:600 }}>{s.dayName}</div>
                   <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>
-                    {s.date} · {s.entries.length} exercises · {totalSets} sets{s.durationMin != null ? ` · ${fmtDur(s.durationMin)}` : ""}
+                    {s.date}{s.gym ? ` · ${s.gym}` : ""} · {s.entries.length} exercises · {totalSets} sets{s.durationMin != null ? ` · ${fmtDur(s.durationMin)}` : ""}
                   </div>
                 </div>
                 <div style={{ textAlign:"right" }}>
@@ -1093,7 +1189,7 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey }) {
         <button onClick={onBack} style={{ background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 14px", fontSize:13, cursor:"pointer" }}>← Back</button>
         <div style={{ flex:1 }}>
           <div style={{ fontSize:16, fontWeight:700 }}>{session.dayName}</div>
-          <div style={{ fontSize:11, color:C.dim }}>{session.date}{session.durationMin!=null ? ` · ${fmtDur(session.durationMin)}` : ""}{session.bodyweight!=null ? ` · BW ${session.bodyweight}kg` : ""}{session.feel!=null ? ` · feel ${session.feel}/10` : ""}</div>
+          <div style={{ fontSize:11, color:C.dim }}>{session.date}{session.gym ? ` · ${session.gym}` : ""}{session.durationMin!=null ? ` · ${fmtDur(session.durationMin)}` : ""}{session.bodyweight!=null ? ` · BW ${session.bodyweight}kg` : ""}{session.feel!=null ? ` · feel ${session.feel}/10` : ""}</div>
         </div>
         <button onClick={() => onEdit(session)} style={{ background:C.panel2, color:C.acc, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 14px", fontSize:13, cursor:"pointer", whiteSpace:"nowrap" }}>Edit</button>
       </div>
@@ -1624,21 +1720,30 @@ function InjuryTab({ injuries, saveInjuries, sessions }) {
    Goals tab — generate a science-based mesocycle
    ============================================================ */
 function GoalsTab({ onInstall, current, setTab }) {
+  const [mode, setMode] = useState("hyp"); // hyp = RP mesocycle | str = 5/3/1
   const [days, setDays] = useState(6);
   const [goal, setGoal] = useState("gain");
   const [accum, setAccum] = useState(4);
   const [bench, setBench] = useState("");
   const [squat, setSquat] = useState("");
   const [dead, setDead] = useState("");
+  const [press, setPress] = useState("");
   const [bw, setBw] = useState("");
   const [options, setOptions] = useState(null);
   const [preview, setPreview] = useState(null); // generated program being previewed
 
   const sel = { background:C.bg, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"10px 12px", fontSize:14, width:"100%" };
   const num = v => v === "" ? null : Number(v) || null;
-  const stats = { bench:num(bench), squat:num(squat), dead:num(dead), bodyweight:num(bw) };
+  const stats = { bench:num(bench), squat:num(squat), dead:num(dead), press:num(press), bodyweight:num(bw) };
 
   const generate = () => {
+    if (mode === "str") {
+      const prog = generate531({ stats });
+      setOptions([{ split: { id:"531bbb", name:"5/3/1 Boring But Big",
+        blurb:"4 days. One main lift per day on percent waves (5s / 3s / 5-3-1 / deload), 5×10 supplemental, accessories. TM = 90% of 1RM." }, prog }]);
+      setPreview(null);
+      return;
+    }
     const splits = splitsForDays(days);
     setOptions(splits.map(s => ({
       split: s,
@@ -1652,8 +1757,18 @@ function GoalsTab({ onInstall, current, setTab }) {
   return (
     <div>
       <div style={card}>
-        <div style={{ fontSize:12, color:C.dim, marginBottom:12, textTransform:"uppercase", letterSpacing:0.5 }}>Build a mesocycle</div>
+        <div style={{ fontSize:12, color:C.dim, marginBottom:12, textTransform:"uppercase", letterSpacing:0.5 }}>Build a program</div>
 
+        <label style={{ fontSize:11, color:C.dim }}>Program type</label>
+        <div style={{ display:"flex", gap:6, marginTop:6, marginBottom:14 }}>
+          {[["hyp","Hypertrophy (RP meso)"],["str","Strength (5/3/1)"]].map(([k, lbl]) => (
+            <button key={k} onClick={() => { setMode(k); setOptions(null); setPreview(null); }} style={{
+              flex:1, background: mode===k ? C.panel2 : C.bg, color: mode===k ? C.acc : C.dim,
+              border:`1px solid ${mode===k ? C.acc : C.line}`, borderRadius:8, padding:"10px 4px", fontSize:13, fontWeight:600, cursor:"pointer" }}>{lbl}</button>
+          ))}
+        </div>
+
+        {mode === "hyp" && <>
         <label style={{ fontSize:11, color:C.dim }}>Training days per week</label>
         <div style={{ display:"flex", gap:6, marginTop:6, marginBottom:14 }}>
           {[3,4,5,6].map(d => (
@@ -1679,21 +1794,30 @@ function GoalsTab({ onInstall, current, setTab }) {
           <option value={5}>5 accumulation + 1 deload (6 wk)</option>
           <option value={6}>6 accumulation + 1 deload (7 wk)</option>
         </select>
+        </>}
 
-        <div style={{ fontSize:11, color:C.dim, marginBottom:6 }}>Strength stats — working weight or est. 1RM (kg). Used to seed barbell loads; leave blank to start those blank too.</div>
+        <div style={{ fontSize:11, color:C.dim, marginBottom:6 }}>
+          {mode === "str"
+            ? "1RMs (kg) — actual or estimated maxes. Training max is set to 90%; all working weights are percentages of that."
+            : "Strength stats — working weight or est. 1RM (kg). Used to seed barbell loads; leave blank to start those blank too."}
+        </div>
         <div style={{ display:"flex", gap:8, marginBottom:8 }}>
           <StatIn label="Bench" val={bench} onChange={setBench} />
           <StatIn label="Squat" val={squat} onChange={setSquat} />
           <StatIn label="Deadlift" val={dead} onChange={setDead} />
         </div>
-        <StatIn label="Bodyweight" val={bw} onChange={setBw} wide />
+        <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+          {mode === "str" && <StatIn label="OHP" val={press} onChange={setPress} />}
+          <StatIn label="Bodyweight" val={bw} onChange={setBw} />
+          {mode !== "str" && <div style={{ flex:1 }} />}
+        </div>
 
-        <button onClick={generate} style={{ ...btn(C.acc, "#04150E"), marginTop:14 }}>Generate programs</button>
+        <button onClick={generate} style={{ ...btn(C.acc, "#04150E"), marginTop:14 }}>{mode === "str" ? "Generate 5/3/1 cycle" : "Generate programs"}</button>
       </div>
 
       {options && options.length > 0 && !preview && (
         <div style={{ marginTop:4 }}>
-          <div style={{ fontSize:12, color:C.dim, margin:"16px 4px 4px", textTransform:"uppercase", letterSpacing:0.5 }}>{options.length} option{options.length>1?"s":""} for {days} days</div>
+          <div style={{ fontSize:12, color:C.dim, margin:"16px 4px 4px", textTransform:"uppercase", letterSpacing:0.5 }}>{options.length} option{options.length>1?"s":""}{options[0] && options[0].prog && options[0].prog.meso && options[0].prog.meso.type === "531" ? "" : ` for ${days} days`}</div>
           {options.map(({ split, prog }) => (
             <div key={split.id} style={card}>
               <div style={{ fontSize:15, fontWeight:700 }}>{split.name}</div>
@@ -1722,16 +1846,23 @@ function GoalsTab({ onInstall, current, setTab }) {
                 const ex = LIB.find(l => l.key === it.key);
                 const t = it.target;
                 const reps = t.repLo === t.repHi ? `${t.repLo}` : `${t.repLo}–${t.repHi}`;
+                const line = t.plan
+                  ? t.plan.map(p => `${p.w}×${p.r}${p.plus ? "+" : ""}`).join(" · ")
+                  : `${t.sets}×${reps}${t.w!=null ? ` · ${t.w}kg${it.est?"*":""}` : ""}`;
                 return (
                   <div key={i} style={{ display:"flex", justifyContent:"space-between", fontSize:13, padding:"4px 0", borderBottom: i<d.items.length-1?`1px solid ${C.line}`:"none" }}>
                     <span>{ex ? ex.n : it.key}</span>
-                    <span style={{ color:C.dim }}>{t.sets}×{reps}{t.w!=null ? ` · ${t.w}kg${it.est?"*":""}` : ""}</span>
+                    <span style={{ color:C.dim }}>{line}</span>
                   </div>
                 );
               })}
             </div>
           ))}
-          <div style={{ fontSize:11, color:C.dim, margin:"6px 4px" }}>* estimated starting load — confirm/adjust on first session. Set counts shown are week 1; they ramp up each week.</div>
+          <div style={{ fontSize:11, color:C.dim, margin:"6px 4px" }}>
+            {preview.prog.meso && preview.prog.meso.type === "531"
+              ? "Main-lift weights follow the weekly percent wave; advance the week from the Program tab. After the deload, regenerate with 1RMs bumped +2.5kg upper / +5kg lower."
+              : "* estimated starting load — confirm/adjust on first session. Set counts shown are week 1; they ramp up each week."}
+          </div>
           <button onClick={() => onInstall(preview.prog)} style={{ ...btn(C.acc, "#04150E"), marginTop:6 }}>Use this program</button>
         </div>
       )}
@@ -1762,8 +1893,20 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
   const st = mesoStatus(program);
   const addDay = () => setProgram({ ...program, days: [...program.days, { id: uid(), name:"New day", items: [] }] });
   const rmDay = id => setProgram({ ...program, days: program.days.filter(d => d.id !== id) });
+  const dupDay = id => setProgram({ ...program, days: program.days.flatMap(d => d.id===id
+    ? [d, { id: uid(), name: d.name + " (copy)", items: d.items.map(it => ({ ...it, target: it.target ? { ...it.target } : null })) }]
+    : [d]) });
+  const moveDay = (id, dir) => setProgram((() => {
+    const i = program.days.findIndex(d => d.id === id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= program.days.length) return program;
+    const a = [...program.days]; [a[i], a[j]] = [a[j], a[i]];
+    return { ...program, days: a };
+  })());
   const rename = (id, name) => setProgram({ ...program, days: program.days.map(d => d.id===id ? { ...d, name } : d) });
   const addItem = (dId, exKey) => setProgram({ ...program, days: program.days.map(d => d.id===dId ? { ...d, items: [...d.items, { key:exKey, target: T(3,8,12,null) }] } : d) });
+  const swapItem = (dId, idx, exKey) => setProgram({ ...program, days: program.days.map(d => d.id===dId
+    ? { ...d, items: d.items.map((it, i) => i===idx ? { ...it, key: exKey, est: false } : it) } : d) });
   const rmItem = (dId, idx) => setProgram({ ...program, days: program.days.map(d => d.id===dId ? { ...d, items: d.items.filter((_, i) => i !== idx) } : d) });
   const moveItem = (dId, from, to) => setProgram({ ...program, days: program.days.map(d => {
     if (d.id !== dId) return d; const a = [...d.items]; if (to<0||to>=a.length) return d;
@@ -1778,7 +1921,7 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
             <div>
               <div style={{ fontSize:14, fontWeight:700, color: st.isDeload ? C.gold : C.acc }}>{st.label}</div>
-              <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{st.splitName} · {st.goalLabel} · RIR {st.rir.lo}–{st.rir.hi}</div>
+              <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>{st.splitName} · {st.goalLabel}{st.rir ? ` · RIR ${st.rir.lo}–${st.rir.hi}` : ""}</div>
             </div>
             <div style={{ fontSize:11, color:C.dim, textAlign:"right" }}>{st.accumWeeks} accum<br/>+1 deload</div>
           </div>
@@ -1786,6 +1929,11 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
             <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${C.line}`, fontSize:12, color:C.dim, lineHeight:1.5 }}>
               {st.cardio && <div>Cardio: {st.cardio.note}</div>}
               {st.nutrition && <div>Calories: {st.nutrition.cal} · Protein: {st.nutrition.protein}</div>}
+            </div>
+          )}
+          {st.type === "531" && st.tms && (
+            <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${C.line}`, fontSize:12, color:C.dim }}>
+              Training maxes: {["press","bench","squat","dead"].filter(k => st.tms[k]).map(k => `${k.toUpperCase()} ${st.tms[k]}kg`).join(" · ") || "none set"}
             </div>
           )}
           <div style={{ display:"flex", gap:10, marginTop:12 }}>
@@ -1800,7 +1948,11 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
                 <button onClick={() => setConfirmExit(false)} style={btn(C.panel2, C.dim)}>Cancel</button>
                 <button onClick={() => { onExitMeso(); setConfirmExit(false); }} style={btn(C.gold, "#1A1206")}>End it</button>
               </div>}
-          <div style={{ fontSize:10, color:C.dim, marginTop:8 }}>Advancing recomputes set counts (volume ramp) and the RIR target. Your logged/edited weights are kept — load progression runs per-session.</div>
+          <div style={{ fontSize:10, color:C.dim, marginTop:8 }}>
+            {st.type === "531"
+              ? "Advancing moves the percent wave (5s → 3s → 5/3/1 → deload). After the deload, regenerate from Goals with 1RMs +2.5kg upper / +5kg lower."
+              : "Advancing recomputes set counts (volume ramp) and the RIR target. Your logged/edited weights are kept — load progression runs per-session."}
+          </div>
         </div>
       )}
 
@@ -1809,10 +1961,25 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
         <input style={{ ...inp, width:60 }} inputMode="numeric" value={program.target} onChange={e => setProgram({ ...program, target: Number(e.target.value)||0 })} />
       </div>
 
+      <div style={{ ...card, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div>
+          <div style={{ fontSize:13, fontWeight:600 }}>Work down (back-off sets)</div>
+          <div style={{ fontSize:11, color:C.dim }}>after the top set, suggest −10% (heavy lifts) / −5% (compounds)</div>
+        </div>
+        <button onClick={() => setProgram({ ...program, workDown: program.workDown === false ? true : false })}
+          style={{ background: program.workDown === false ? C.bg : C.panel2, color: program.workDown === false ? C.dim : C.acc,
+            border:`1px solid ${program.workDown === false ? C.line : C.acc}`, borderRadius:14, padding:"6px 16px", fontSize:13, fontWeight:700, cursor:"pointer" }}>
+          {program.workDown === false ? "off" : "on"}
+        </button>
+      </div>
+
       {program.days.map(d => (
         <div key={d.id} style={card}>
           <div style={{ display:"flex", gap:8, marginBottom:10 }}>
             <input style={{ ...inp, textAlign:"left", fontWeight:600 }} value={d.name} onChange={e => rename(d.id, e.target.value)} />
+            <button onClick={() => moveDay(d.id, -1)} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:8, padding:"0 10px", cursor:"pointer" }}>↑</button>
+            <button onClick={() => moveDay(d.id, 1)} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:8, padding:"0 10px", cursor:"pointer" }}>↓</button>
+            <button onClick={() => dupDay(d.id)} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:8, padding:"0 10px", cursor:"pointer" }}>dup</button>
             <button onClick={() => rmDay(d.id)} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:8, padding:"0 12px", cursor:"pointer" }}>del</button>
           </div>
           <DragList
@@ -1830,6 +1997,8 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
                       <div style={{ fontSize:13, fontWeight:600 }}>{ex ? ex.n : "(missing)"}</div>
                       {ex && <div style={{ fontSize:10, color:C.dim }}>{ex.m} · {T_LABEL[ex.t]}{rpHint(ex) ? " · " + rpHint(ex) : ""}</div>}
                     </div>
+                    <button onClick={() => openPicker(k => swapItem(d.id, i, k), ex ? ex.m : "")} title="swap exercise"
+                      style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:6, height:30, padding:"0 8px", cursor:"pointer", fontSize:11, marginRight:4 }}>swap</button>
                     <button onClick={() => rmItem(d.id, i)} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:6, width:30, height:30, cursor:"pointer" }}>×</button>
                   </div>
                   <div style={{ display:"flex", gap:6, marginTop:8, alignItems:"flex-end" }}>
@@ -1891,8 +2060,8 @@ function TgtField({ label, val, onChange }) {
 /* ============================================================
    Exercise picker (library + add custom)
    ============================================================ */
-function Picker({ custom, onAddCustom, onPick, onClose }) {
-  const [q, setQ] = useState("");
+function Picker({ custom, onAddCustom, onPick, onClose, initialQ }) {
+  const [q, setQ] = useState(initialQ || "");
   const [adding, setAdding] = useState(false);
   const all = useMemo(() => [...LIB, ...custom], [custom]);
   const groups = useMemo(() => {
