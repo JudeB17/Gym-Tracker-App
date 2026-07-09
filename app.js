@@ -164,6 +164,38 @@ function App() {
     return null;
   }, [sessions]);
 
+  /* Anchor sets for weight-progression suggestions (wr only).
+     Window = last 4 sessions containing the exercise. Up to two
+     consecutive sessions below the recent best are treated as off days
+     and ignored (anchor to the best recent session instead). Three
+     consecutive sessions below the recent best = genuine regression, so
+     accept the reset and anchor to the most recent session.
+     lastForExercise stays as-is for display. */
+  const refSetsForExercise = useCallback(key => {
+    const recent = []; // newest first, up to 4
+    for (let i = sessions.length - 1; i >= 0 && recent.length < 4; i--) {
+      const e = sessions[i].entries.find(x => x.key === key);
+      if (e && e.sets.length) recent.push(e.sets);
+    }
+    if (!recent.length) return null;
+    const topW = sets => Math.max(0, ...sets.map(s => s.w || 0));
+    if (recent.length === 1) return { sets: recent[0], offDay: false };
+    const w = recent.map(topW);
+    const refW = Math.max(...w);
+    if (!(refW > 0)) return { sets: recent[0], offDay: false };
+    const TOL = 0.95;
+    // last session at (or near) the recent best -> normal
+    if (w[0] >= refW * TOL) return { sets: recent[0], offDay: false };
+    // count consecutive misses ending at the most recent session
+    let misses = 0;
+    while (misses < w.length && w[misses] < refW * TOL) misses++;
+    // three or more in a row -> consistent, accept the reset
+    if (misses >= 3) return { sets: recent[0], offDay: false };
+    // one or two off days -> anchor to the best recent session instead
+    const bestIdx = w.indexOf(refW);
+    return { sets: recent[bestIdx], offDay: true, refW };
+  }, [sessions]);
+
   /* ---- prefill model ----
      For a given exercise key + its program target, produce the ghost values
      shown as input placeholders, plus a corrected target. Sources, in order:
@@ -217,13 +249,15 @@ function App() {
       // 2) history → double progression with per-set plan
       if (exType === "wr") {
         const band = t ? { repLo: t.repLo, repHi: t.repHi } : null;
-        const sug = suggestNext(prev, ex, band, {
-          deload: mesoDeload, nSets: nSets || prev.length, workDown
+        const ref = refSetsForExercise(key) || { sets: prev, offDay: false };
+        const sug = suggestNext(ref.sets, ex, band, {
+          deload: mesoDeload, nSets: nSets || ref.sets.length, workDown
         });
         if (sug) {
           const plan = sug.plan.map(p => ({ w: String(p.w), r: String(p.r) }));
           if (t) t.w = sug.topW;
-          return { target: t, ghostW: plan[0].w, ghostR: plan[0].r, est: false, plan, progNote: sug.reason };
+          const note = ref.offDay ? `off day ignored — back to ${sug.topW}kg` : sug.reason;
+          return { target: t, ghostW: plan[0].w, ghostR: plan[0].r, est: false, plan, progNote: note };
         }
       }
       if (exType === "wd") {
@@ -271,7 +305,7 @@ function App() {
     // fall through: reps ghost from target if present
     if (t && t.repLo != null) ghostR = String(t.repLo);
     return { target: t, ghostW, ghostR, est, plan: null, progNote: "" };
-  }, [lastForExercise, mesoDeload, mesoStats, lastBodyweight, exByKey, workDown]);
+  }, [lastForExercise, refSetsForExercise, mesoDeload, mesoStats, lastBodyweight, exByKey, workDown]);
 
   /* ---- session lifecycle ---- */
   const startSession = useCallback(() => {
@@ -1161,16 +1195,16 @@ function HistoryList({ sessions, onOpen }) {
             const totalSets = s.entries.reduce((a, e) => a + e.sets.length, 0);
             const vol = s.entries.reduce((a, e) => a + e.sets.reduce((b, x) => b + (x.w||0)*(x.r||0), 0), 0);
             return (
-              <button key={s.id} onClick={() => onOpen(s)} style={{ ...card, width:"100%", textAlign:"left", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                <div>
+              <button key={s.id} onClick={() => onOpen(s)} style={{ ...card, width:"100%", textAlign:"left", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center", gap:12 }}>
+                <div style={{ flex:1, minWidth:0 }}>
                   <div style={{ fontSize:14, fontWeight:600 }}>{s.dayName}</div>
                   <div style={{ fontSize:11, color:C.dim, marginTop:2 }}>
                     {s.date}{s.gym ? ` · ${s.gym}` : ""} · {s.entries.length} exercises · {totalSets} sets{s.durationMin != null ? ` · ${fmtDur(s.durationMin)}` : ""}
                   </div>
                 </div>
-                <div style={{ textAlign:"right" }}>
+                <div style={{ textAlign:"right", flexShrink:0, whiteSpace:"nowrap" }}>
                   {vol > 0 && <div style={{ fontSize:13, fontWeight:700, color:C.blue }}>{Math.round(vol).toLocaleString()}<span style={{ fontSize:10, color:C.dim }}> kg·r</span></div>}
-              {(s.injuries||[]).length > 0 && <div style={{ fontSize:10, color:C.knee, marginTop:2 }}>{s.injuries.length} injury note{s.injuries.length>1?"s":""}</div>}
+                  {(s.injuries||[]).length > 0 && <div style={{ fontSize:10, color:C.knee, marginTop:2 }}>{s.injuries.length} injury note{s.injuries.length>1?"s":""}</div>}
                 </div>
               </button>
             );
