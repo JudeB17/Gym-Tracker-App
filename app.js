@@ -453,6 +453,13 @@ function App() {
     const row = { key, n: ex.n, m: ex.m, e: ex.e, t: ex.t, role: ex.role || "compound", rp: ex.rp || [8,12] };
     const next = [...custom, row]; setCustom(next); await sSet("library:custom", next); return key;
   }, [custom]);
+  const updateCustom = useCallback(async (key, ex) => {
+    // keep the key so program items + logged history stay bound to this exercise
+    const next = custom.map(c => c.key === key
+      ? { ...c, n: ex.n, m: ex.m, e: ex.e, t: ex.t, role: ex.role || "compound", rp: ex.rp || [8,12] }
+      : c);
+    setCustom(next); await sSet("library:custom", next);
+  }, [custom]);
   const removeCustom = useCallback(async key => {
     const next = custom.filter(c => c.key !== key); setCustom(next); await sSet("library:custom", next);
   }, [custom]);
@@ -546,7 +553,7 @@ function App() {
         {tab === "injury" && <InjuryTab injuries={injuries} saveInjuries={saveInjuries} sessions={sessions} />}
         {tab === "goals" && <GoalsTab onInstall={installGenerated} current={program} setTab={setTab} />}
         {tab === "program" && <ProgramEditor program={program} setProgram={saveProgram} exByKey={exByKey}
-          openPicker={openPicker} custom={custom} removeCustom={removeCustom}
+          openPicker={openPicker} custom={custom} removeCustom={removeCustom} updateCustom={updateCustom}
           exportJson={exportJson} importJson={importJson} onReset={resetProgram}
           onAdvanceWeek={advanceWeek} onExitMeso={exitMeso} />}
       </div>
@@ -1921,7 +1928,7 @@ function StatIn({ label, val, onChange, wide }) {
 /* ============================================================
    Program editor — drag reorder of exercises within a day
    ============================================================ */
-function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, removeCustom, exportJson, importJson, onReset, onAdvanceWeek, onExitMeso }) {
+function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, removeCustom, updateCustom, exportJson, importJson, onReset, onAdvanceWeek, onExitMeso }) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmExit, setConfirmExit] = useState(false);
   const st = mesoStatus(program);
@@ -2051,17 +2058,7 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
 
       <button onClick={addDay} style={{ ...btn(C.panel2, C.ink), marginTop:12 }}>+ day</button>
 
-      {custom.length > 0 && (
-        <div style={{ ...card, marginTop:20 }}>
-          <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Your custom exercises</div>
-          {custom.map(c => (
-            <div key={c.key} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
-              <div style={{ fontSize:13 }}>{c.n} <span style={{ color:C.dim, fontSize:11 }}>· {c.m} · {T_LABEL[c.t]}</span></div>
-              <button onClick={() => removeCustom(c.key)} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:6, padding:"2px 10px", cursor:"pointer", fontSize:12 }}>del</button>
-            </div>
-          ))}
-        </div>
-      )}
+      <CustomLibrary program={program} custom={custom} removeCustom={removeCustom} updateCustom={updateCustom} />
 
       <div style={{ ...card, marginTop:20 }}>
         <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Backup & reset</div>
@@ -2094,6 +2091,78 @@ function TgtField({ label, val, onChange }) {
 /* ============================================================
    Exercise picker (library + add custom)
    ============================================================ */
+/* Manage your own exercises: edit in place (key is preserved, so program slots
+   and logged history stay attached) or delete with a usage warning. */
+function CustomLibrary({ program, custom, removeCustom, updateCustom }) {
+  const [editing, setEditing] = useState(null);   // key being edited
+  const [confirmDel, setConfirmDel] = useState(null);
+  const usage = useMemo(() => {
+    const m = {};
+    (program?.days || []).forEach(d => d.items.forEach(it => { m[it.key] = (m[it.key] || 0) + 1; }));
+    return m;
+  }, [program]);
+  const allNames = useMemo(() => [...LIB.map(e => e.n), ...custom.map(c => c.n)], [custom]);
+
+  return (
+    <div style={{ ...card, marginTop:20 }}>
+      <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Your exercises</div>
+      {custom.length === 0 && (
+        <div style={{ fontSize:12, color:C.dim, lineHeight:1.5 }}>
+          Nothing added yet. Tap <span style={{ color:C.acc }}>+ add exercise</span> on any day above, search for the
+          movement, and if it isn't in the library hit <span style={{ color:C.acc }}>+ create</span> at the bottom of the picker.
+        </div>
+      )}
+      {custom.map(c => {
+        const used = usage[c.key] || 0;
+        if (editing === c.key) {
+          return (
+            <div key={c.key} style={{ background:C.bg, border:`1px solid ${C.line}`, borderRadius:8, padding:12, marginBottom:8 }}>
+              <CustomForm
+                initial={c}
+                existingNames={allNames}
+                saveLabel="Save changes"
+                onCancel={() => setEditing(null)}
+                onSave={async ex => { await updateCustom(c.key, ex); setEditing(null); }} />
+            </div>
+          );
+        }
+        return (
+          <div key={c.key} style={{ marginBottom:8 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:8 }}>
+              <div style={{ fontSize:13, minWidth:0 }}>
+                {c.n}
+                <div style={{ color:C.dim, fontSize:11 }}>
+                  {c.m} · {c.e} · {T_LABEL[c.t]}{used ? ` · in ${used} program slot${used>1?"s":""}` : ""}
+                </div>
+              </div>
+              <div style={{ display:"flex", gap:6, flexShrink:0 }}>
+                <button onClick={() => { setConfirmDel(null); setEditing(c.key); }}
+                  style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:6, padding:"2px 10px", cursor:"pointer", fontSize:12 }}>edit</button>
+                <button onClick={() => setConfirmDel(confirmDel === c.key ? null : c.key)}
+                  style={{ background:"transparent", border:`1px solid ${confirmDel === c.key ? C.warn : C.line}`, color: confirmDel === c.key ? C.warn : C.dim, borderRadius:6, padding:"2px 10px", cursor:"pointer", fontSize:12 }}>del</button>
+              </div>
+            </div>
+            {confirmDel === c.key && (
+              <div style={{ marginTop:6, padding:"8px 10px", background:C.bg, border:`1px solid ${C.warn}`, borderRadius:8 }}>
+                <div style={{ fontSize:11, color:C.dim, lineHeight:1.5, marginBottom:8 }}>
+                  {used
+                    ? `Used in ${used} program slot${used>1?"s":""} — those will show as "(missing)" until you swap in a replacement. `
+                    : ""}
+                  Logged history keeps the name but drops out of muscle-volume totals.
+                </div>
+                <div style={{ display:"flex", gap:8 }}>
+                  <button onClick={() => setConfirmDel(null)} style={{ ...btn(C.panel2, C.dim), padding:"7px 10px", fontSize:12 }}>Cancel</button>
+                  <button onClick={() => { removeCustom(c.key); setConfirmDel(null); }} style={{ ...btn("transparent", C.warn), border:`1px solid ${C.warn}`, padding:"7px 10px", fontSize:12 }}>Delete</button>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Picker({ custom, onAddCustom, onPick, onClose, initialQ }) {
   const [q, setQ] = useState(initialQ || "");
   const [adding, setAdding] = useState(false);
@@ -2104,6 +2173,11 @@ function Picker({ custom, onAddCustom, onPick, onClose, initialQ }) {
     const by = {}; filtered.forEach(e => { (by[e.m] = by[e.m] || []).push(e); });
     return MUSCLES.filter(m => by[m]).map(m => [m, by[m]]);
   }, [all, q]);
+  const existingNames = useMemo(() => all.map(e => e.n), [all]);
+  // if the search text is itself a muscle name, seed the new-exercise muscle with it
+  const qTrim = q.trim();
+  const seedMuscle = MUSCLES.find(m => m.toLowerCase() === qTrim.toLowerCase()) || null;
+  const seedName = seedMuscle ? "" : qTrim;
 
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.6)", zIndex:60, display:"flex", flexDirection:"column" }} onClick={onClose}>
@@ -2115,38 +2189,60 @@ function Picker({ custom, onAddCustom, onPick, onClose, initialQ }) {
           </div>
           {!adding && <input style={{ ...inp, textAlign:"left" }} value={q} placeholder="search name / muscle / equipment" onChange={e => setQ(e.target.value)} autoFocus />}
         </div>
-        <div style={{ overflowY:"auto", padding:14 }}>
+        <div style={{ overflowY:"auto", padding:14, flex:1 }}>
           {adding
-            ? <CustomForm onCancel={() => setAdding(false)} onSave={async ex => { const k = await onAddCustom(ex); onPick(k); }} />
+            ? <CustomForm
+                initialName={seedName}
+                initialMuscle={seedMuscle}
+                existingNames={existingNames}
+                onCancel={() => setAdding(false)}
+                onSave={async ex => { const k = await onAddCustom(ex); setAdding(false); setQ(""); onPick(k); }} />
             : <>
                 {groups.map(([m, list]) => (
                   <div key={m} style={{ marginBottom:14 }}>
                     <div style={{ fontSize:11, color:C.dim, textTransform:"uppercase", letterSpacing:0.5, marginBottom:6 }}>{m}</div>
                     {list.map(e => (
                       <button key={e.key} onClick={() => onPick(e.key)} style={{ display:"flex", justifyContent:"space-between", width:"100%", background:C.bg, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"10px 12px", marginBottom:6, cursor:"pointer", textAlign:"left" }}>
-                        <span style={{ fontSize:14 }}>{e.n}</span>
+                        <span style={{ fontSize:14 }}>
+                          {e.n}
+                          {e.key.startsWith("cus:") && <span style={{ fontSize:10, color:C.acc, marginLeft:6 }}>own</span>}
+                        </span>
                         <span style={{ fontSize:11, color:C.dim }}>{e.e}{rpHint(e) ? " · " + rpHint(e) : ""}</span>
                       </button>
                     ))}
                   </div>
                 ))}
                 {groups.length === 0 && <Empty msg="No matches." />}
-                <button onClick={() => setAdding(true)} style={{ ...btn(C.panel2, C.acc), border:`1px dashed ${C.line}`, marginTop:6 }}>+ create custom exercise</button>
               </>}
         </div>
+        {!adding && (
+          <div style={{ padding:"10px 14px calc(14px + env(safe-area-inset-bottom))", borderTop:`1px solid ${C.line}`, background:C.panel }}>
+            <button onClick={() => setAdding(true)} style={{ ...btn(C.panel2, C.acc), border:`1px dashed ${C.acc}`, marginTop:0 }}>
+              {seedName ? `+ create "${seedName}"` : "+ create custom exercise"}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
 }
-function CustomForm({ onCancel, onSave }) {
-  const [n, setN] = useState(""); const [m, setM] = useState(MUSCLES[0]);
-  const [e, setE] = useState("Barbell"); const [t, setT] = useState("wr"); const [role, setRole] = useState("compound");
+function CustomForm({ initial, initialName, initialMuscle, existingNames, saveLabel, onCancel, onSave }) {
+  const [n, setN] = useState(initial?.n ?? initialName ?? "");
+  const [m, setM] = useState(initial?.m ?? initialMuscle ?? MUSCLES[0]);
+  const [e, setE] = useState(initial?.e ?? "Barbell");
+  const [t, setT] = useState(initial?.t ?? "wr");
+  const [role, setRole] = useState(initial?.role ?? "compound");
   const sel = { background:C.bg, color:C.ink, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 10px", fontSize:14, width:"100%" };
   const RP_RANGE = { heavy:[5,10], compound:[8,12], iso:[10,15], small:[12,20], rehab:[10,15] };
+  const trimmed = n.trim();
+  const dupe = trimmed.length > 0 && (existingNames || [])
+    .some(x => x.toLowerCase() === trimmed.toLowerCase() && x.toLowerCase() !== (initial?.n || "").toLowerCase());
+  const canSave = trimmed.length > 0 && !dupe;
   return (
     <div>
       <label style={{ fontSize:11, color:C.dim }}>name</label>
-      <input style={{ ...inp, textAlign:"left", marginBottom:10 }} value={n} onChange={ev => setN(ev.target.value)} autoFocus />
+      <input style={{ ...inp, textAlign:"left", marginBottom: dupe ? 4 : 10, borderColor: dupe ? C.warn : undefined }} value={n} onChange={ev => setN(ev.target.value)} autoFocus />
+      {dupe && <div style={{ fontSize:11, color:C.warn, marginBottom:10 }}>"{trimmed}" already exists — pick a different name.</div>}
       <label style={{ fontSize:11, color:C.dim }}>muscle</label>
       <select style={{ ...sel, marginBottom:10 }} value={m} onChange={ev => setM(ev.target.value)}>{MUSCLES.map(x => <option key={x}>{x}</option>)}</select>
       <label style={{ fontSize:11, color:C.dim }}>equipment</label>
@@ -2163,7 +2259,11 @@ function CustomForm({ onCancel, onSave }) {
       </select>
       <div style={{ display:"flex", gap:10 }}>
         <button onClick={onCancel} style={btn(C.panel2, C.dim)}>Cancel</button>
-        <button onClick={() => n.trim() && onSave({ n: n.trim(), m, e, t, role, rp: RP_RANGE[role] })} style={btn(C.acc, "#04150E")}>Add & use</button>
+        <button disabled={!canSave}
+          onClick={() => canSave && onSave({ n: trimmed, m, e, t, role, rp: RP_RANGE[role] })}
+          style={{ ...btn(canSave ? C.acc : C.panel2, canSave ? "#04150E" : C.dim), cursor: canSave ? "pointer" : "not-allowed" }}>
+          {saveLabel || "Add & use"}
+        </button>
       </div>
     </div>
   );
