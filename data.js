@@ -986,19 +986,32 @@
      a lifting session. Tune here, not in app.js.
      ========================================================== */
   const MUSCLE_WEIGHT = {
-    Quads: 1.6, Glutes: 1.5, Back: 1.4, Hamstrings: 1.2, Chest: 1.2,
-    Shoulders: 1.0, Triceps: 0.8, Biceps: 0.7, Calves: 0.7, Core: 0.6,
-    Forearms: 0.4, Cardio: 0.4, "Mobility/Rehab": 0.2
+    Quads: 1.0, Glutes: 1.0, Back: 1.0, Hamstrings: 1.0, Chest: 1.0,
+    Shoulders: 1.0, Triceps: 1.0, Biceps: 1.0, Calves: 1.0, Core: 1.0,
+    Forearms: 1.0, Cardio: 0.5, "Mobility/Rehab": 0.3
   };
+  /* Calibrated Sep 2026 on 32 real sessions. Body parts are even: a quality
+     set is a quality set. The earlier size tilt (quads 1.6 … forearms 0.4)
+     was not what inflated leg days; the linear PR bonus was. Cardio and
+     mobility stay low so they don't pad a lifting session. */
   const EWS = {
-    perSet: 5,          // points for one full-quality working set at weight 1.0
+    perSet: 5,          // points for one full-quality working set
     dropCredit: 0.5,    // a drop row is worth half a set (not junk, but not a fresh set)
-    junkCredit: 0.15,   // junk set credit (<50% of top load, or far off target)
+    junkCredit: 0.15,   // junk set credit (<=50% of top load, or far off target)
     lightCredit: 0.6,   // 50-70% of top load: light but not junk
     rpe: { hard: 7, mid: 6, midCredit: 0.6, easyCredit: 0.25 }, // when RPE is logged
-    lastPerPct: 0.5,    // points per % e1RM change vs last session, x perSet x weight
-    lastFloorPct: -10,  // regression vs last is capped at -10% (a bad day can't nuke the score)
-    prPerPct: 1.0       // points per % over all-time best, x perSet x weight
+    /* improvement terms are a FRACTION OF THE EXERCISE'S OWN BASE, through a
+       log so big jumps have diminishing returns (rehab, machine increments):
+         h(pct) = ln(1 + |pct| / pctScale) with sign of pct
+         improve = base_ex × lastK × h(%Δ vs last session)   (floored at lastFloorPct)
+         pr      = base_ex × prK   × h(% over prior best)     (needs prMinPrior sessions)
+       at the defaults a +3% PR adds ~52% of that exercise's base, +10% adds
+       ~110%, +25% adds ~167%. Never capped, just concave. */
+    pctScale: 3,
+    lastK: 0.25,
+    prK: 0.5,
+    lastFloorPct: -10,  // regression vs last is capped at -10%
+    prMinPrior: 2       // PR bonus needs at least this many prior sessions of the exercise
   };
 
   window.GymData = {

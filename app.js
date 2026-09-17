@@ -125,14 +125,17 @@ const exMapFromLib = () => { const m = new Map(); LIB.forEach(e => m.set(e.key, 
        reps < 50% of program repLo    -> junkCredit             nowhere near target
        load < 50% of program target w -> junkCredit
        otherwise                      -> 1.0
-   IMPROVE = Σ exercises  perSet × muscleWeight × lastPerPct × %Δ best e1RM vs
-             the previous session containing that exercise (floored at -10%).
-             rep-only exercises use Epley on bodyweight (reps move the 1+r/30
-             term only), holds use 1 + sec/120, so every exercise moves on the
-             same % scale.
-   PR      = Σ exercises  perSet × muscleWeight × prPerPct × % over prior
-             all-time best (only when the session sets a new best).
-   Both bonuses need at least one prior session of the exercise.
+   IMPROVE = Σ exercises  base_ex × lastK × h(%Δ best e1RM vs the previous
+             session containing that exercise), floored at lastFloorPct.
+   PR      = Σ exercises  base_ex × prK × h(% over prior all-time best), only
+             when the session sets a new best and the exercise has at least
+             prMinPrior prior sessions.
+   h(p) = sign(p) × ln(1 + |p| / pctScale): concave, uncapped. Scaling by the
+   exercise's own base means a jump on one rehab set can't outscore a whole
+   session, which is what the first linear version did (calibrated on 32
+   real sessions: leg-day PR bonus averaged 83 on a base of 37).
+   e1RM scale: wr = Epley; rep-only = Epley on bodyweight (reps move the
+   1+r/30 term only); holds = 1 + sec/120. All exercises move on the same %.
    ============================================================ */
 function exMetricBest(entry, bw) {
   /* single comparable number for an entry, all on an e1RM-like % scale:
@@ -191,22 +194,25 @@ function scoreSession(session, sessions, exResolve, programDays) {
     let improve = 0, pr = 0, note = "";
     const now = exMetricBest(e, bw);
     if (now > 0 && (e.t === "wr" || e.t === "rep" || e.t === "time")) {
-      let last = 0, best = 0;
+      let last = 0, best = 0, nPrior = 0;
       byDate.forEach((s, i) => {
         const pe = s.entries.find(x => x.key === e.key);
         if (!pe || !pe.sets.length) return;
         const m = exMetricBest(pe, s.bodyweight || bwForSession(byDate, i));
-        if (m > 0) { last = m; if (m > best) best = m; }
+        if (m > 0) { last = m; nPrior++; if (m > best) best = m; }
       });
+      const h = p => Math.sign(p) * Math.log(1 + Math.abs(p) / EWS.pctScale);
       if (last > 0) {
         const pct = Math.max(EWS.lastFloorPct, (now - last) / last * 100);
-        improve = EWS.perSet * w * EWS.lastPerPct * pct;
+        improve = base * EWS.lastK * h(pct);
         note = (pct >= 0 ? "+" : "") + pct.toFixed(1) + "% vs last";
       }
-      if (best > 0 && now > best) {
+      if (best > 0 && now > best && nPrior >= EWS.prMinPrior) {
         const pct = (now - best) / best * 100;
-        pr = EWS.perSet * w * EWS.prPerPct * pct;
+        pr = base * EWS.prK * h(pct);
         note += (note ? " · " : "") + "PR +" + pct.toFixed(1) + "%";
+      } else if (best > 0 && now > best) {
+        note += (note ? " · " : "") + "new best (PR bonus from session " + (EWS.prMinPrior + 1) + ")";
       }
     }
     const junk = sets.filter(q => q.why === "junk").length;
@@ -1598,11 +1604,12 @@ function EwsCard({ ews, showFormula, setShowFormula }) {
       {showFormula && (
         <div style={{ fontSize:11, color:C.dim, marginTop:10, lineHeight:1.5 }}>
           <div><b style={{ color:C.ink }}>base</b> = Σ sets {EWS.perSet} × muscle weight × quality</div>
-          <div style={{ paddingLeft:10 }}>muscle weight: quads {MUSCLE_WEIGHT.Quads} · glutes {MUSCLE_WEIGHT.Glutes} · back {MUSCLE_WEIGHT.Back} · chest {MUSCLE_WEIGHT.Chest} · hams {MUSCLE_WEIGHT.Hamstrings} · delts {MUSCLE_WEIGHT.Shoulders} · tris {MUSCLE_WEIGHT.Triceps} · bis {MUSCLE_WEIGHT.Biceps} · calves {MUSCLE_WEIGHT.Calves} · core {MUSCLE_WEIGHT.Core} · forearms {MUSCLE_WEIGHT.Forearms}</div>
+          <div style={{ paddingLeft:10 }}>muscle weight: all lifting muscles {MUSCLE_WEIGHT.Chest} (even) · cardio {MUSCLE_WEIGHT.Cardio} · mobility {MUSCLE_WEIGHT["Mobility/Rehab"]}</div>
           <div style={{ paddingLeft:10 }}>quality: full set 1.0 · drop row {EWS.dropCredit} · light (50–70% of top load) {EWS.lightCredit} · junk (&lt;50% of top load, or under half the target reps/weight) {EWS.junkCredit}</div>
           <div style={{ paddingLeft:10 }}>if RPE logged: ≥{EWS.rpe.hard} → 1.0 · {EWS.rpe.mid} → {EWS.rpe.midCredit} · ≤{EWS.rpe.mid-1} → {EWS.rpe.easyCredit}</div>
-          <div><b style={{ color:C.ink }}>vs last</b> = Σ exercises {EWS.perSet} × muscle weight × {EWS.lastPerPct} × %Δ best e1RM vs your previous session of it (floor {EWS.lastFloorPct}%)</div>
-          <div><b style={{ color:C.ink }}>PR</b> = Σ exercises {EWS.perSet} × muscle weight × {EWS.prPerPct} × % over your prior all-time best</div>
+          <div><b style={{ color:C.ink }}>vs last</b> = Σ exercises (that exercise's base) × {EWS.lastK} × h(%Δ best e1RM vs your previous session of it), floor {EWS.lastFloorPct}%</div>
+          <div><b style={{ color:C.ink }}>PR</b> = Σ exercises (that exercise's base) × {EWS.prK} × h(% over your prior all-time best), needs {EWS.prMinPrior}+ prior sessions</div>
+          <div style={{ paddingLeft:10 }}>h(p) = ln(1 + p/{EWS.pctScale}): +3% ≈ +{Math.round(EWS.prK*Math.log(1+3/EWS.pctScale)*100)}% of the exercise's base as PR bonus, +10% ≈ +{Math.round(EWS.prK*Math.log(1+10/EWS.pctScale)*100)}%, +25% ≈ +{Math.round(EWS.prK*Math.log(1+25/EWS.pctScale)*100)}%. Diminishing, never capped.</div>
           <div style={{ marginTop:4 }}>e1RM = Epley on the best set; bodyweight moves use bodyweight + load, so 8→10 reps is +5%, not +25%; holds use 1 + sec/120. No cap: more quality sets and bigger jumps always score higher.</div>
         </div>
       )}
