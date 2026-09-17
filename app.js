@@ -5,7 +5,7 @@
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 const { MUSCLES, LIB, T, rpHint, defaultProgram,
         GOALS, SPLITS, splitsForDays, generateProgram, applyWeek, mesoStatus,
-        seedWeight, volumeBand, LANDMARKS,
+        seedWeight, volumeBand, LANDMARKS, roundLoad, MUSCLE_WEIGHT, EWS,
         suggestNext, incFor, generate531 } = window.GymData;
 const { sGet, sSet, sDel, available } = window.GymStore;
 
@@ -24,6 +24,29 @@ const T_LABEL = { wr: "weight×reps", rep: "reps", time: "hold", wd: "load+dist"
 const uid = () => Math.random().toString(36).slice(2, 9);
 const TODAY = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const e1rm = (w, r) => (!w || !r) ? 0 : w * (1 + r / 30); // Epley
+/* ---- drop sets / loaded bodyweight helpers ----
+   A set with drop:true is a no-rest continuation of the row above it. For
+   volume (RP landmarks) a top set + its drops = ONE set, so counts use
+   workSets(). For progression the engine already ignores rows under 90% of
+   the top weight, but we strip drops first so they never inflate nSets.
+   Bodyweight ("rep") sets carry an optional add (kg): +10 = weighted,
+   -10 = assisted (machine assist / band). e1RM for those needs bodyweight:
+   load = bw + add. */
+const workSets = sets => (sets || []).filter(s => !s.drop);
+const isLoadedSet = s => s && s.add != null && Number(s.add) !== 0;
+const fmtAdd = add => add == null || Number(add) === 0 ? "" : (Number(add) > 0 ? "+" : "-") + Math.abs(Number(add)) + "kg";
+/* bodyweight for a session: its own, else the nearest session that has one
+   (previous preferred). null if nothing is known anywhere. */
+function bwForSession(sessions, idx) {
+  const at = sessions[idx];
+  if (at && at.bodyweight) return at.bodyweight;
+  for (let i = idx - 1; i >= 0; i--) if (sessions[i].bodyweight) return sessions[i].bodyweight;
+  for (let i = idx + 1; i < sessions.length; i++) if (sessions[i].bodyweight) return sessions[i].bodyweight;
+  return null;
+}
+/* e1RM of a loaded bodyweight set; 0 if bodyweight unknown or set unloaded */
+const repE1rm = (s, bw) => (!bw || !isLoadedSet(s)) ? 0 : e1rm(bw + Number(s.add), s.r);
+const SS_COLORS = ["#4DD6A6", "#6BA6E5", "#E5B96B", "#C98BE5", "#E56B9E"];
 const fmtDur = min => min == null ? "" : min >= 60 ? `${Math.floor(min/60)}h ${min%60}m` : `${min}m`;
 const fmtSec = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
 const daysAgo = dateStr => {
@@ -37,11 +60,12 @@ function bestE1rmBefore(sessions, key, excludeId) {
     if (s.id === excludeId) return;
     const e = s.entries.find(x => x.key === key);
     if (e && e.t === "wr") e.sets.forEach(x => { const v = e1rm(x.w, x.r); if (v > best) best = v; });
+    if (e && e.t === "rep") { const bw = bwForSession(sessions, sessions.indexOf(s)); e.sets.forEach(x => { const v = repE1rm(x, bw); if (v > best) best = v; }); }
   });
   return best;
 }
 function blankSet(t) {
-  const b = { wr:{w:"",r:"",rpe:""}, rep:{r:"",rpe:""}, time:{sec:""}, wd:{w:"",dist:""}, cardio:{sec:"",dist:""} }[t];
+  const b = { wr:{w:"",r:"",rpe:""}, rep:{r:"",add:"",rpe:""}, time:{sec:""}, wd:{w:"",dist:""}, cardio:{sec:"",dist:""} }[t];
   return { ...b, done: false };
 }
 function isoWeek(dateStr) {
@@ -84,6 +108,119 @@ function migrateSession(s) {
 const exMapFromLib = () => { const m = new Map(); LIB.forEach(e => m.set(e.key, e)); return m; };
 
 /* ============================================================
+   EWS — Estimated Workout Score
+   ------------------------------------------------------------
+   Unbounded: more quality work = higher score, always.
+
+   score = BASE + IMPROVE + PR
+
+   BASE   = Σ sets  perSet × muscleWeight × quality
+     quality (first rule that applies):
+       drop row                       -> dropCredit (0.5)      not junk, but half a set
+       RPE logged  ≥ 7                -> 1.0
+       RPE logged  = 6                -> 0.6
+       RPE logged  ≤ 5                -> 0.25                  you said it was easy
+       load < 50% of exercise top     -> junkCredit (0.15)     warm-up / junk
+       load 50–70% of top             -> lightCredit (0.6)
+       reps < 50% of program repLo    -> junkCredit             nowhere near target
+       load < 50% of program target w -> junkCredit
+       otherwise                      -> 1.0
+   IMPROVE = Σ exercises  perSet × muscleWeight × lastPerPct × %Δ best e1RM vs
+             the previous session containing that exercise (floored at -10%).
+             rep-only exercises use Epley on bodyweight (reps move the 1+r/30
+             term only), holds use 1 + sec/120, so every exercise moves on the
+             same % scale.
+   PR      = Σ exercises  perSet × muscleWeight × prPerPct × % over prior
+             all-time best (only when the session sets a new best).
+   Both bonuses need at least one prior session of the exercise.
+   ============================================================ */
+function exMetricBest(entry, bw) {
+  /* single comparable number for an entry, all on an e1RM-like % scale:
+       wr            Epley e1RM of the best set
+       rep (loaded)  Epley on (bodyweight + load)
+       rep (plain)   Epley on bodyweight (or 1.0 if unknown): reps only move the
+                     (1 + r/30) term, so 8→10 reps is +5%, same as it would be
+                     on the bar, not +25%
+       time          1 + sec/120, so 60→90 s is +17%, not +50%
+       wd / cardio   no metric */
+  if (!entry.sets.length) return 0;
+  if (entry.t === "wr") return Math.max(0, ...entry.sets.map(x => e1rm(x.w, x.r)));
+  if (entry.t === "rep") {
+    const base = bw || 1;
+    return Math.max(0, ...entry.sets.map(x => e1rm(base + (Number(x.add) || 0), x.r)));
+  }
+  if (entry.t === "time") return Math.max(0, ...entry.sets.map(x => x.sec ? 1 + x.sec / 120 : 0));
+  return 0;
+}
+function setQuality(set, entry, topW, target) {
+  if (set.drop) return { q: EWS.dropCredit, why: "drop" };
+  if (set.rpe != null && set.rpe !== "") {
+    const r = Number(set.rpe);
+    if (r >= EWS.rpe.hard) return { q: 1, why: "" };
+    if (r >= EWS.rpe.mid) return { q: EWS.rpe.midCredit, why: "RPE " + r };
+    return { q: EWS.rpe.easyCredit, why: "easy" };
+  }
+  const load = entry.t === "wr" ? (set.w || 0) : null;
+  if (load != null && topW > 0) {
+    if (load <= topW * 0.5) return { q: EWS.junkCredit, why: "junk" };
+    if (load < topW * 0.7) return { q: EWS.lightCredit, why: "light" };
+  }
+  if (target) {
+    if (target.repLo && (set.r || 0) < target.repLo * 0.5 && entry.t !== "time") return { q: EWS.junkCredit, why: "junk" };
+    if (target.w && load != null && load < target.w * 0.5) return { q: EWS.junkCredit, why: "junk" };
+  }
+  return { q: 1, why: "" };
+}
+/* sessions: full list (any order). programDays: to find the day's targets.
+   Returns { total, base, improve, pr, ex:[{name,key,muscle,weight,base,improve,pr,sets:[{q,why}],junk}] } */
+function scoreSession(session, sessions, exResolve, programDays) {
+  const byDate = sessions.filter(s => s.id !== session.id && s.date <= session.date)
+    .sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+  const bw = session.bodyweight || bwForSession(sessions, sessions.indexOf(session));
+  const day = programDays ? programDays.find(d => d.id === session.dayId) : null;
+  const out = { total: 0, base: 0, improve: 0, pr: 0, ex: [] };
+  session.entries.forEach(e => {
+    const ex = exResolve(e.key);
+    const muscle = ex ? ex.m : null;
+    const w = muscle && MUSCLE_WEIGHT[muscle] != null ? MUSCLE_WEIGHT[muscle] : 1;
+    const target = day ? (day.items.find(it => it.key === e.key) || {}).target : null;
+    const topW = e.t === "wr" ? Math.max(0, ...e.sets.map(x => x.w || 0)) : 0;
+    const sets = e.sets.map(s => setQuality(s, e, topW, target));
+    const base = sets.reduce((a, q) => a + EWS.perSet * w * q.q, 0);
+    // improvement vs last session with this exercise, and vs all-time best
+    let improve = 0, pr = 0, note = "";
+    const now = exMetricBest(e, bw);
+    if (now > 0 && (e.t === "wr" || e.t === "rep" || e.t === "time")) {
+      let last = 0, best = 0;
+      byDate.forEach((s, i) => {
+        const pe = s.entries.find(x => x.key === e.key);
+        if (!pe || !pe.sets.length) return;
+        const m = exMetricBest(pe, s.bodyweight || bwForSession(byDate, i));
+        if (m > 0) { last = m; if (m > best) best = m; }
+      });
+      if (last > 0) {
+        const pct = Math.max(EWS.lastFloorPct, (now - last) / last * 100);
+        improve = EWS.perSet * w * EWS.lastPerPct * pct;
+        note = (pct >= 0 ? "+" : "") + pct.toFixed(1) + "% vs last";
+      }
+      if (best > 0 && now > best) {
+        const pct = (now - best) / best * 100;
+        pr = EWS.perSet * w * EWS.prPerPct * pct;
+        note += (note ? " · " : "") + "PR +" + pct.toFixed(1) + "%";
+      }
+    }
+    const junk = sets.filter(q => q.why === "junk").length;
+    out.ex.push({ key: e.key, name: e.name, muscle, weight: w, base, improve, pr, sets, junk, note });
+    out.base += base; out.improve += improve; out.pr += pr;
+  });
+  out.total = out.base + out.improve + out.pr;
+  return out;
+}
+const fmtEws = v => String(Math.round(v));
+const EWS_COLOR = "#E5B96B";
+
+
+/* ============================================================
    App
    ============================================================ */
 function App() {
@@ -102,11 +239,13 @@ function App() {
   const [gyms, setGyms] = useState([]);          // known gym names
   const lastGym = useRef(null);                   // most recently used gym
 
-  const flash = useCallback(m => { setToast(m); setTimeout(() => setToast(""), 1800); }, []);
+  const flash = useCallback(m => { setToast(m); setTimeout(() => setToast(""), m.length > 30 ? 3200 : 1800); }, []);
   const allEx = useMemo(() => [...LIB, ...custom], [custom]);
   const exByKey = useCallback(k => allEx.find(e => e.key === k), [allEx]);
 
   const saveProgram = useCallback(async p => { setProgram(p); await sSet("program:current", p); }, []);
+  /* EWS for any session against the current session list + program targets */
+  const scoreOf = useCallback(s => scoreSession(s, sessions, exByKey, program ? program.days : null), [sessions, exByKey, program]);
 
   /* ---- draft persistence: survive PWA kill / accidental close ---- */
   const draftReady = useRef(false);
@@ -250,8 +389,9 @@ function App() {
       if (exType === "wr") {
         const band = t ? { repLo: t.repLo, repHi: t.repHi } : null;
         const ref = refSetsForExercise(key) || { sets: prev, offDay: false };
-        const sug = suggestNext(ref.sets, ex, band, {
-          deload: mesoDeload, nSets: nSets || ref.sets.length, workDown
+        const refWork = workSets(ref.sets).length ? workSets(ref.sets) : ref.sets;
+        const sug = suggestNext(refWork, ex, band, {
+          deload: mesoDeload, nSets: nSets || refWork.length, workDown
         });
         if (sug) {
           const plan = sug.plan.map(p => ({ w: String(p.w), r: String(p.r) }));
@@ -266,11 +406,21 @@ function App() {
         return { target: t, ghostW, ghostR, est: false, plan: null, progNote: "" };
       }
       if (exType === "rep") {
-        const ref = prev.reduce((a, s) => (s.r || 0) >= (a.r || 0) ? s : a, prev[0]);
+        const pw = workSets(prev).length ? workSets(prev) : prev;
+        // anchor on the heaviest loading; among equal loads, the most reps
+        const ref = pw.reduce((a, s) => {
+          const la = Number(a.add) || 0, ls = Number(s.add) || 0;
+          if (ls > la) return s;
+          if (ls === la && (s.r || 0) >= (a.r || 0)) return s;
+          return a;
+        }, pw[0]);
         const cap = (t && t.repHi) || null;
         const next = (ref.r || 0) + 1;
         ghostR = String(cap ? Math.min(next, cap) : next);
-        return { target: t, ghostW, ghostR, est: false, plan: null, progNote: ref.r ? `last ${ref.r} — try ${ghostR}` : "" };
+        const ghostAdd = ref.add != null && Number(ref.add) !== 0 ? String(ref.add) : "";
+        const addStr = fmtAdd(ref.add);
+        return { target: t, ghostW, ghostR, ghostAdd, est: false, plan: null,
+                 progNote: ref.r ? `last ${ref.r}${addStr ? " " + addStr : ""} — try ${ghostR}` : "" };
       }
       if (exType === "time") {
         const ref = prev.reduce((a, s) => (s.sec || 0) >= (a.sec || 0) ? s : a, prev[0]);
@@ -321,8 +471,8 @@ function App() {
         const pf = prefillFor(it.key, it.target, ex.t, ex.n, { wrIndex });
         if (ex.t === "wr") wrIndex++;
         const nSets = it.target?.sets || 1;
-        return { eid: uid(), key: it.key, name: ex.n, t: ex.t, note: "",
-          est: pf.est, target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR,
+        return { eid: uid(), key: it.key, name: ex.n, t: ex.t, note: "", group: null,
+          est: pf.est, target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR, ghostAdd: pf.ghostAdd || "",
           plan: pf.plan || null, progNote: pf.progNote || "",
           sets: Array.from({ length: nSets }, () => blankSet(ex.t)) };
       }).filter(Boolean)
@@ -336,8 +486,8 @@ function App() {
       const wrIndex = d.entries.filter(e => e.t === "wr").length;
       const pf = prefillFor(exKey, null, ex.t, ex.n, { wrIndex });
       const nSets = pf.plan ? pf.plan.length : 1;
-      return { ...d, entries: [...d.entries, { eid: uid(), key: exKey, name: ex.n, t: ex.t, note: "",
-        target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR, est: pf.est,
+      return { ...d, entries: [...d.entries, { eid: uid(), key: exKey, name: ex.n, t: ex.t, note: "", group: null,
+        target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR, ghostAdd: pf.ghostAdd || "", est: pf.est,
         plan: pf.plan || null, progNote: pf.progNote || "",
         sets: Array.from({ length: nSets }, () => blankSet(ex.t)) }] };
     });
@@ -345,7 +495,7 @@ function App() {
 
   const saveSession = useCallback(async () => {
     const notEmpty = (t, s) => ({
-      wr: () => s.w !== "" || s.r !== "", rep: () => s.r !== "",
+      wr: () => s.w !== "" || s.r !== "", rep: () => s.r !== "" || (s.add !== "" && s.add != null),
       time: () => s.sec !== "", wd: () => s.w !== "" || s.dist !== "",
       cardio: () => s.sec !== "" || s.dist !== ""
     })[t]();
@@ -358,15 +508,21 @@ function App() {
       injuries: (draft.injuries || []).filter(i => i.pain > 0 || i.swelling || i.note),
       entries: draft.entries.map(e => ({
         key: e.key, name: e.name, t: e.t, note: e.note || "",
+        ...(e.group ? { group: e.group } : {}),
         sets: e.sets.filter(s => notEmpty(e.t, s)).map(s => {
-          if (e.t === "wr") return { w: num(s.w), r: num(s.r), rpe: s.rpe === "" ? null : Number(s.rpe) };
-          if (e.t === "rep") return { r: num(s.r), rpe: s.rpe === "" ? null : Number(s.rpe) };
+          const dropFlag = s.drop ? { drop: true } : {};
+          if (e.t === "wr") return { w: num(s.w), r: num(s.r), rpe: s.rpe === "" ? null : Number(s.rpe), ...dropFlag };
+          if (e.t === "rep") return { r: num(s.r), add: (s.add === "" || s.add == null) ? null : (Number(s.add) || 0), rpe: s.rpe === "" ? null : Number(s.rpe), ...dropFlag };
           if (e.t === "time") return { sec: num(s.sec) };
           if (e.t === "wd") return { w: num(s.w), dist: num(s.dist) };
           return { sec: num(s.sec), dist: num(s.dist) };
         })
       })).filter(e => e.sets.length > 0 || e.note)
     };
+    // a superset needs two members; drop the tag if only one survived cleanup
+    const gCount = {};
+    clean.entries.forEach(e => { if (e.group) gCount[e.group] = (gCount[e.group] || 0) + 1; });
+    clean.entries = clean.entries.map(e => (e.group && gCount[e.group] < 2) ? (({ group, ...rest }) => rest)(e) : e);
     if (clean.entries.length === 0 && clean.injuries.length === 0) { flash("Nothing logged."); return; }
     // duration: from live timer on new sessions, preserved on edits
     clean.durationMin = draft.startedAt
@@ -376,8 +532,10 @@ function App() {
     // PR scan: any wr exercise whose best e1RM beats all prior history
     let prCount = 0;
     clean.entries.forEach(e => {
-      if (e.t !== "wr") return;
-      const best = Math.max(0, ...e.sets.map(s => e1rm(s.w, s.r)));
+      let best = 0;
+      if (e.t === "wr") best = Math.max(0, ...e.sets.map(s => e1rm(s.w, s.r)));
+      else if (e.t === "rep" && clean.bodyweight) best = Math.max(0, ...e.sets.map(s => repE1rm(s, clean.bodyweight)));
+      else return;
       if (!best) return;
       const prior = bestE1rmBefore(sessions, e.key, clean.id);
       if (prior > 0 && best > prior) prCount++;
@@ -401,8 +559,14 @@ function App() {
     }
     await sDel("draft:current");
     setDraft(null); setTab("history");
-    flash((existingIdx >= 0 ? "Updated." : "Saved.") + (prCount ? ` ${prCount} PR${prCount > 1 ? "s" : ""}.` : ""));
-  }, [draft, sessions, gyms, flash]);
+    // EWS readout: score, and delta vs the previous session of the same program day
+    const ews = scoreSession(clean, next, exByKey, program ? program.days : null);
+    const prevSame = sessions.filter(s => s.id !== clean.id && s.dayId === clean.dayId && s.date <= clean.date)
+      .sort((a, b) => a.date < b.date ? 1 : -1)[0];
+    let ewsMsg = ` EWS ${fmtEws(ews.total)}`;
+    if (prevSame) { const d = ews.total - scoreSession(prevSame, next, exByKey, program ? program.days : null).total; ewsMsg += ` (${d >= 0 ? "+" : ""}${fmtEws(d)})`; }
+    flash((existingIdx >= 0 ? "Updated." : "Saved.") + (prCount ? ` ${prCount} PR${prCount > 1 ? "s" : ""}.` : "") + ewsMsg + ".");
+  }, [draft, sessions, gyms, flash, exByKey, program]);
 
   const discardDraft = useCallback(async () => {
     await sDel("draft:current");
@@ -434,10 +598,12 @@ function App() {
       feel: session.feel == null ? null : session.feel,
       injuries: [...logged, ...extra],
       entries: session.entries.map(e => ({
-        eid: uid(), key: e.key, name: e.name, t: e.t, note: e.note || "", target: null, ghostW: "", ghostR: "",
+        eid: uid(), key: e.key, name: e.name, t: e.t, note: e.note || "", target: null, ghostW: "", ghostR: "", ghostAdd: "",
+        group: e.group || null,
         sets: (e.sets.length ? e.sets : [blankSet(e.t)]).map(s => {
-          if (e.t === "wr") return { w: toStr(s.w), r: toStr(s.r), rpe: toStr(s.rpe) };
-          if (e.t === "rep") return { r: toStr(s.r), rpe: toStr(s.rpe) };
+          const dropFlag = s.drop ? { drop: true } : {};
+          if (e.t === "wr") return { w: toStr(s.w), r: toStr(s.r), rpe: toStr(s.rpe), ...dropFlag };
+          if (e.t === "rep") return { r: toStr(s.r), add: toStr(s.add), rpe: toStr(s.rpe), ...dropFlag };
           if (e.t === "time") return { sec: toStr(s.sec) };
           if (e.t === "wd") return { w: toStr(s.w), dist: toStr(s.dist) };
           return { sec: toStr(s.sec), dist: toStr(s.dist) };
@@ -546,10 +712,10 @@ function App() {
         )}
         {tab === "history" && (
           viewSession
-            ? <SessionDetail session={viewSession} onBack={() => setViewSession(null)} onDelete={deleteSession} onEdit={editSession} exByKey={exByKey} />
-            : <HistoryList sessions={sessions} onOpen={setViewSession} />
+            ? <SessionDetail session={viewSession} onBack={() => setViewSession(null)} onDelete={deleteSession} onEdit={editSession} exByKey={exByKey} scoreOf={scoreOf} />
+            : <HistoryList sessions={sessions} onOpen={setViewSession} scoreOf={scoreOf} />
         )}
-        {tab === "trends" && <Trends sessions={sessions} allEx={allEx} exResolve={exByKey} />}
+        {tab === "trends" && <Trends sessions={sessions} allEx={allEx} exResolve={exByKey} scoreOf={scoreOf} />}
         {tab === "injury" && <InjuryTab injuries={injuries} saveInjuries={saveInjuries} sessions={sessions} />}
         {tab === "goals" && <GoalsTab onInstall={installGenerated} current={program} setTab={setTab} />}
         {tab === "program" && <ProgramEditor program={program} setProgram={saveProgram} exByKey={exByKey}
@@ -732,6 +898,64 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
   const startRest = useCallback(() => {
     if (restLenRef.current > 0) setRestEnd(Date.now() + restLenRef.current * 1000);
   }, []);
+  const draftRef = useRef(draft);
+  useEffect(() => { draftRef.current = draft; }, [draft]);
+  /* Rest only fires when the block is actually over:
+       - not if the next row of this exercise is a drop (no rest inside a drop set)
+       - not if this exercise is followed by another member of its superset */
+  const onSetDone = useCallback((entry, setIdx) => {
+    const nextRow = entry.sets[setIdx + 1];
+    if (nextRow && nextRow.drop) return;
+    if (entry.group) {
+      const ents = draftRef.current.entries;
+      const at = ents.findIndex(e => e.eid === entry.eid);
+      if (ents.some((e, j) => j > at && e.group === entry.group)) return;
+    }
+    startRest();
+  }, [startRest]);
+
+  /* ---- supersets (ad hoc, per session) ----
+     pairing = eid of the card that started a pair. Tapping "pair" on a second
+     card joins them (reusing either card's existing group), then the joined
+     card is moved to sit directly after the group so the log flows A1, A2. */
+  const [pairing, setPairing] = useState(null);
+  const groupLabels = useMemo(() => {
+    const m = {}; let n = 0;
+    draft.entries.forEach(e => { if (e.group && !(e.group in m)) m[e.group] = n++; });
+    return m; // group id -> ordinal (0 = A)
+  }, [draft.entries]);
+  const groupInfo = e => {
+    if (!e.group || !(e.group in groupLabels)) return null;
+    const ord = groupLabels[e.group];
+    const members = draft.entries.filter(x => x.group === e.group);
+    const idx = members.findIndex(x => x.eid === e.eid);
+    return { letter: String.fromCharCode(65 + ord), idx: idx + 1, color: SS_COLORS[ord % SS_COLORS.length], size: members.length };
+  };
+  const pairWith = eid => {
+    const first = pairing; setPairing(null);
+    if (!first || first === eid) return;
+    setDraft(d => {
+      const a = d.entries.find(e => e.eid === first), b = d.entries.find(e => e.eid === eid);
+      if (!a || !b) return d;
+      const gid = a.group || b.group || uid();
+      let ents = d.entries.map(e => (e.eid === first || e.eid === eid || (a.group && e.group === a.group) || (b.group && e.group === b.group)) ? { ...e, group: gid } : e);
+      // keep the group contiguous: pull the newly joined card in behind the group's last member
+      const joined = ents.find(e => e.eid === eid);
+      ents = ents.filter(e => e.eid !== eid);
+      let lastIdx = -1; ents.forEach((e, i) => { if (e.group === gid) lastIdx = i; });
+      ents.splice(lastIdx + 1, 0, joined);
+      return { ...d, entries: ents };
+    });
+  };
+  const unlink = eid => setDraft(d => {
+    const me = d.entries.find(e => e.eid === eid); if (!me || !me.group) return d;
+    const left = d.entries.filter(e => e.group === me.group && e.eid !== eid);
+    return { ...d, entries: d.entries.map(e => {
+      if (e.eid === eid) return { ...e, group: null };
+      if (left.length < 2 && e.group === me.group) return { ...e, group: null }; // a group of one is not a superset
+      return e;
+    }) };
+  });
 
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const totalSets = draft.entries.reduce((a, e) => a + e.sets.length, 0);
@@ -762,7 +986,7 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
           </button>
         </div>
         <GymPicker gym={draft.gym} gyms={gyms || []} onSet={g => setDraft(d => ({ ...d, gym: g }))} />
-        <div style={{ fontSize:10, color:C.dim, marginTop:4 }}>tap a set number to mark it done · long-press ⠿ to reorder</div>
+        <div style={{ fontSize:10, color:C.dim, marginTop:4 }}>tap a set number to mark it done · long-press ⠿ to reorder · ↓ = drop set (no rest) · SS = superset</div>
       </div>
 
       <DragList
@@ -770,7 +994,11 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
         keyOf={e => e.eid || e.key}
         onMove={moveEntry}
         render={(e, i, dragHandle) => (
-          <ExerciseCard entry={e} setEntry={setEntry} rmEntry={rmEntry} prev={lastForExercise(e.key)} ex={exByKey(e.key)} dragHandle={dragHandle} onSetDone={startRest} />
+          <ExerciseCard entry={e} setEntry={setEntry} rmEntry={rmEntry} prev={lastForExercise(e.key)} ex={exByKey(e.key)} dragHandle={dragHandle} onSetDone={onSetDone}
+            ss={groupInfo(e)} pairing={pairing}
+            onPairStart={() => setPairing(p => p === e.eid ? null : e.eid)}
+            onPairWith={() => pairWith(e.eid)}
+            onUnlink={() => unlink(e.eid)} />
         )}
       />
 
@@ -917,17 +1145,31 @@ function DragList({ items, keyOf, onMove, render }) {
   );
 }
 
-function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDone }) {
+function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDone, ss, pairing, onPairStart, onPairWith, onUnlink }) {
   const blank = blankSet(entry.t);
   const [collapsed, setCollapsed] = useState(false);
   const [plates, setPlates] = useState(false);
-  const addSet = () => setEntry(entry.eid, e => ({ ...e, sets: [...e.sets, { ...(e.sets[e.sets.length-1] || blank), done: false }] }));
+  // new normal set copies the last NON-drop row (a drop row is not a template for a fresh set)
+  const addSet = () => setEntry(entry.eid, e => {
+    const tmpl = [...e.sets].reverse().find(s => !s.drop) || e.sets[e.sets.length-1] || blank;
+    const { drop, ...rest } = tmpl;
+    return { ...e, sets: [...e.sets, { ...rest, done: false }] };
+  });
+  // drop row: continues the row above with no rest. Weight left blank so the
+  // placeholder (~-20% of the row above) shows; reps blank too.
+  const addDrop = () => setEntry(entry.eid, e => {
+    if (!e.sets.length) return e;
+    const last = e.sets[e.sets.length-1];
+    const row = { ...last, done: false, drop: true, r: "", rpe: "" };
+    if ("w" in row) row.w = "";
+    return { ...e, sets: [...e.sets, row] };
+  });
   const rmSet = i => setEntry(entry.eid, e => ({ ...e, sets: e.sets.filter((_, j) => j !== i) }));
   const upd = (i, k, v) => setEntry(entry.eid, e => ({ ...e, sets: e.sets.map((s, j) => j===i ? { ...s, [k]: v } : s) }));
   const toggleDone = i => {
     const wasDone = !!entry.sets[i].done;
     setEntry(entry.eid, e => ({ ...e, sets: e.sets.map((s, j) => j===i ? { ...s, done: !s.done } : s) }));
-    if (!wasDone && onSetDone) onSetDone();
+    if (!wasDone && onSetDone) onSetDone(entry, i);
   };
   const setNote = v => setEntry(entry.eid, e => ({ ...e, note: v }));
   // copy last session's actual values into the inputs (placeholders don't save)
@@ -935,22 +1177,33 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
     if (!prev || !prev.length) return;
     const toStr = v => v == null ? "" : String(v);
     setEntry(entry.eid, e => ({ ...e, sets: prev.map(s => {
-      if (e.t === "wr") return { w: toStr(s.w), r: toStr(s.r), rpe: toStr(s.rpe), done: false };
-      if (e.t === "rep") return { r: toStr(s.r), rpe: toStr(s.rpe), done: false };
+      const d = s.drop ? { drop: true } : {};
+      if (e.t === "wr") return { w: toStr(s.w), r: toStr(s.r), rpe: toStr(s.rpe), done: false, ...d };
+      if (e.t === "rep") return { r: toStr(s.r), add: toStr(s.add), rpe: toStr(s.rpe), done: false, ...d };
       if (e.t === "time") return { sec: toStr(s.sec), done: false };
       if (e.t === "wd") return { w: toStr(s.w), dist: toStr(s.dist), done: false };
       return { sec: toStr(s.sec), dist: toStr(s.dist), done: false };
     }) }));
   };
 
-  const cols = { wr:["kg","reps","rpe"], rep:["reps","rpe"], time:["sec"], wd:["kg","dist m"], cardio:["min","dist km"] }[entry.t];
-  const keys = { wr:["w","r","rpe"], rep:["r","rpe"], time:["sec"], wd:["w","dist"], cardio:["sec","dist"] }[entry.t];
+  const cols = { wr:["kg","reps","rpe"], rep:["reps","+kg","rpe"], time:["sec"], wd:["kg","dist m"], cardio:["min","dist km"] }[entry.t];
+  const keys = { wr:["w","r","rpe"], rep:["r","add","rpe"], time:["sec"], wd:["w","dist"], cardio:["sec","dist"] }[entry.t];
   const grid = `30px ${cols.map(() => "1fr").join(" ")} 24px`;
   const hint = targetHint(entry.t, entry.target);
   const rp = rpHint(ex);
   const prevStr = prev ? prevSummary(entry.t, prev) : null;
   const nDone = entry.sets.filter(s => s.done).length;
   const ph = (k, i) => {
+    const row = i != null ? entry.sets[i] : null;
+    if (k === "add") return entry.ghostAdd || "0";
+    // drop row: weight ghost = ~80% of the row above (typed value, else its own ghost)
+    if (row && row.drop && k === "w" && i > 0) {
+      const above = entry.sets[i-1];
+      const base = above.w !== "" ? Number(above.w) : Number(ph("w", i-1));
+      const d = base > 0 ? roundLoad(base * 0.8) : null;
+      return d ? String(d) : "—";
+    }
+    if (row && row.drop && k === "r") return "—";
     // per-set plan (double progression / 5/3/1 percents) wins; then program
     // target; then computed ghost (last session / seed).
     const p = entry.plan && entry.plan[i != null ? Math.min(i, entry.plan.length - 1) : 0];
@@ -985,12 +1238,18 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
     return p === "—" ? "" : p;
   };
 
+  const canSS = !!onPairStart;
+  const iAmPairing = pairing === entry.eid;
+  const ssBtn = { background:"transparent", border:`1px solid ${C.line}`, borderRadius:10, padding:"1px 8px", fontSize:10, fontWeight:700, cursor:"pointer", whiteSpace:"nowrap" };
   return (
-    <div style={card}>
+    <div style={{ ...card, borderLeft: ss ? `3px solid ${ss.color}` : card.border }}>
       <div style={{ display:"flex", alignItems:"center", gap:4 }}>
         {dragHandle}
         <div style={{ flex:1, minWidth:0 }}>
-          <div style={{ fontSize:14, fontWeight:600 }}>{entry.name} <span style={{ fontSize:10, color:C.dim, fontWeight:400 }}>· {T_LABEL[entry.t]}</span></div>
+          <div style={{ fontSize:14, fontWeight:600 }}>
+            {ss && <span style={{ fontSize:10, fontWeight:800, color:"#04150E", background:ss.color, borderRadius:6, padding:"1px 6px", marginRight:6, verticalAlign:"middle", letterSpacing:0.5 }}>{ss.letter}{ss.idx}</span>}
+            {entry.name} <span style={{ fontSize:10, color:C.dim, fontWeight:400 }}>· {T_LABEL[entry.t]}</span>
+          </div>
           <div style={{ display:"flex", gap:8, marginTop:2, flexWrap:"wrap" }}>
             {hint && <span style={{ fontSize:11, color:C.acc }}>{hint}</span>}
             {entry.progNote && <span style={{ fontSize:10, fontWeight:600,
@@ -1002,6 +1261,15 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
             <div style={{ display:"flex", gap:8, alignItems:"baseline", marginTop:3, flexWrap:"wrap" }}>
               <span style={{ fontSize:11, color:C.blue, fontWeight:600 }}>last: {prevStr}</span>
               <button onClick={useLast} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.blue, borderRadius:10, padding:"1px 8px", fontSize:10, fontWeight:600, cursor:"pointer" }}>use last</button>
+            </div>
+          )}
+          {canSS && (
+            <div style={{ display:"flex", gap:6, marginTop:4, flexWrap:"wrap", alignItems:"center" }}>
+              {pairing && !iAmPairing
+                ? <button onClick={onPairWith} style={{ ...ssBtn, color:"#04150E", background:C.acc, border:"none" }}>← pair here</button>
+                : <button onClick={onPairStart} style={{ ...ssBtn, color: iAmPairing ? C.gold : C.dim }}>{iAmPairing ? "tap another exercise… (cancel)" : (ss ? "SS +" : "SS")}</button>}
+              {ss && !pairing && <button onClick={onUnlink} style={{ ...ssBtn, color:C.dim }}>unlink</button>}
+              {ss && !pairing && <span style={{ fontSize:10, color:C.dim }}>superset {ss.letter} · rest after {ss.letter}{ss.size}</span>}
             </div>
           )}
         </div>
@@ -1024,8 +1292,8 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
             <button onClick={() => toggleDone(i)} aria-label={s.done ? "mark set not done" : "mark set done"} style={{
               width:28, height:28, borderRadius:14, cursor:"pointer", fontSize:12, fontWeight:700, padding:0,
               background: s.done ? C.acc : "transparent", color: s.done ? "#04150E" : C.dim,
-              border:`1px solid ${s.done ? C.acc : C.line}` }}>
-              {s.done ? "✓" : i+1}
+              border:`1px solid ${s.done ? C.acc : C.line}`, ...(s.drop && !s.done ? { color:C.gold, borderColor:C.gold } : {}) }}>
+              {s.done ? "✓" : (s.drop ? "↓" : i+1)}
             </button>
             {keys.map(k => <input key={k} style={inp} inputMode="decimal" enterKeyHint="next" value={s[k]} placeholder={ph(k, i)}
               onFocus={ev => ev.target.select()} onChange={ev => upd(i, k, ev.target.value)} />)}
@@ -1034,6 +1302,9 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
         ))}
         <div style={{ display:"flex", gap:6 }}>
           <button onClick={addSet} style={{ background:"transparent", border:`1px dashed ${C.line}`, color:C.acc, borderRadius:8, padding:"6px 0", fontSize:12, flex:1, cursor:"pointer" }}>+ set</button>
+          {(entry.t === "wr" || entry.t === "rep") && entry.sets.length > 0 && (
+            <button onClick={addDrop} style={{ background:"transparent", border:`1px dashed ${C.line}`, color:C.gold, borderRadius:8, padding:"6px 12px", fontSize:12, cursor:"pointer", whiteSpace:"nowrap" }}>+ drop</button>
+          )}
           {(entry.t === "wr" || entry.t === "wd") && (
             <button onClick={() => setPlates(true)} style={{ background:"transparent", border:`1px dashed ${C.line}`, color:C.dim, borderRadius:8, padding:"6px 12px", fontSize:12, cursor:"pointer", whiteSpace:"nowrap" }}>plates</button>
           )}
@@ -1113,8 +1384,9 @@ function targetHint(t, target) {
   return `target ${target.sets} sets`;
 }
 function prevSummary(t, sets) {
-  if (t === "wr") return sets.map(s => `${s.w}×${s.r}`).join(", ");
-  if (t === "rep") return sets.map(s => `${s.r}`).join(", ");
+  const dp = s => s.drop ? "↓" : "";
+  if (t === "wr") return sets.map(s => `${dp(s)}${s.w}×${s.r}`).join(", ");
+  if (t === "rep") return sets.map(s => `${dp(s)}${s.r}${isLoadedSet(s) ? fmtAdd(s.add) : ""}`).join(", ");
   if (t === "time") return sets.map(s => `${s.sec}s`).join(", ");
   if (t === "wd") return sets.map(s => `${s.w}kg/${s.dist}m`).join(", ");
   return sets.map(s => `${Math.round((s.sec||0)/60)}min/${s.dist}km`).join(", ");
@@ -1175,7 +1447,7 @@ function DraftInjuries({ draft, setDraft }) {
 /* ============================================================
    History — list of past sessions + read-only detail
    ============================================================ */
-function HistoryList({ sessions, onOpen }) {
+function HistoryList({ sessions, onOpen, scoreOf }) {
   const [q, setQ] = useState("");
   if (sessions.length === 0) return <Empty msg="No sessions logged yet. Start one from the Log tab." />;
   const ql = q.trim().toLowerCase();
@@ -1199,7 +1471,7 @@ function HistoryList({ sessions, onOpen }) {
             {g.wk === thisWeek ? "This week" : g.wk} · {g.items.length} session{g.items.length>1?"s":""}
           </div>
           {g.items.map(s => {
-            const totalSets = s.entries.reduce((a, e) => a + e.sets.length, 0);
+            const totalSets = s.entries.reduce((a, e) => a + workSets(e.sets).length, 0);
             const vol = s.entries.reduce((a, e) => a + e.sets.reduce((b, x) => b + (x.w||0)*(x.r||0), 0), 0);
             return (
               <button key={s.id} onClick={() => onOpen(s)} style={{ ...card, width:"100%", textAlign:"left", cursor:"pointer", display:"flex", justifyContent:"space-between", alignItems:"center", gap:12 }}>
@@ -1210,7 +1482,8 @@ function HistoryList({ sessions, onOpen }) {
                   </div>
                 </div>
                 <div style={{ textAlign:"right", flexShrink:0, whiteSpace:"nowrap" }}>
-                  {vol > 0 && <div style={{ fontSize:13, fontWeight:700, color:C.blue }}>{Math.round(vol).toLocaleString()}<span style={{ fontSize:10, color:C.dim }}> kg·r</span></div>}
+                  {scoreOf && <div style={{ fontSize:13, fontWeight:700, color:EWS_COLOR }}>{fmtEws(scoreOf(s).total)}<span style={{ fontSize:10, color:C.dim }}> EWS</span></div>}
+                  {vol > 0 && <div style={{ fontSize:11, fontWeight:600, color:C.blue }}>{Math.round(vol).toLocaleString()}<span style={{ fontSize:10, color:C.dim }}> kg·r</span></div>}
                   {(s.injuries||[]).length > 0 && <div style={{ fontSize:10, color:C.knee, marginTop:2 }}>{s.injuries.length} injury note{s.injuries.length>1?"s":""}</div>}
                 </div>
               </button>
@@ -1222,8 +1495,11 @@ function HistoryList({ sessions, onOpen }) {
   );
 }
 
-function SessionDetail({ session, onBack, onDelete, onEdit, exByKey }) {
+function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf }) {
   const [confirm, setConfirm] = useState(false);
+  const ews = useMemo(() => scoreOf ? scoreOf(session) : null, [scoreOf, session]);
+  const exScore = key => ews ? ews.ex.find(x => x.key === key) : null;
+  const [showFormula, setShowFormula] = useState(false);
   return (
     <div>
       <div style={{ display:"flex", gap:10, alignItems:"center", marginTop:12 }}>
@@ -1234,24 +1510,45 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey }) {
         </div>
         <button onClick={() => onEdit(session)} style={{ background:C.panel2, color:C.acc, border:`1px solid ${C.line}`, borderRadius:8, padding:"8px 14px", fontSize:13, cursor:"pointer", whiteSpace:"nowrap" }}>Edit</button>
       </div>
-      {session.entries.map((e, idx) => {
+      {ews && <EwsCard ews={ews} showFormula={showFormula} setShowFormula={setShowFormula} />}
+      {(() => {
+        const gl = {}; let gn = 0;
+        session.entries.forEach(e => { if (e.group && !(e.group in gl)) gl[e.group] = gn++; });
+        const seen = {};
+        return session.entries.map((e, idx) => {
         const ex = exByKey(e.key);
+        let ssTag = null;
+        if (e.group && e.group in gl) {
+          seen[e.group] = (seen[e.group] || 0) + 1;
+          ssTag = { color: SS_COLORS[gl[e.group] % SS_COLORS.length], label: String.fromCharCode(65 + gl[e.group]) + seen[e.group] };
+        }
+        const nDrops = e.sets.filter(x => x.drop).length;
+        const repBest = e.t === "rep" && session.bodyweight ? Math.max(0, ...e.sets.map(x => repE1rm(x, session.bodyweight))) : 0;
+        const es = exScore(e.key);
         return (
-          <div key={idx} style={card}>
-            <div style={{ fontSize:14, fontWeight:600 }}>{e.name} <span style={{ fontSize:10, color:C.dim, fontWeight:400 }}>· {T_LABEL[e.t]}</span></div>
+          <div key={idx} style={{ ...card, borderLeft: ssTag ? `3px solid ${ssTag.color}` : card.border }}>
+            <div style={{ fontSize:14, fontWeight:600 }}>
+              {ssTag && <span style={{ fontSize:10, fontWeight:800, color:"#04150E", background:ssTag.color, borderRadius:6, padding:"1px 6px", marginRight:6, verticalAlign:"middle" }}>{ssTag.label}</span>}
+              {e.name} <span style={{ fontSize:10, color:C.dim, fontWeight:400 }}>· {T_LABEL[e.t]}</span>
+              {es && <span style={{ float:"right", fontSize:11, fontWeight:700, color:EWS_COLOR }}>{fmtEws(es.base + es.improve + es.pr)}</span>}
+            </div>
+            {es && es.note && <div style={{ fontSize:10, color: es.pr > 0 ? C.gold : es.improve < 0 ? C.warn : C.dim, marginTop:2 }}>{es.note}</div>}
             <div style={{ marginTop:8 }}>
               {e.sets.map((s, i) => (
                 <div key={i} style={{ display:"flex", gap:10, fontSize:13, padding:"3px 0", borderBottom: i<e.sets.length-1 ? `1px solid ${C.line}` : "none" }}>
-                  <span style={{ color:C.dim, width:20 }}>{i+1}</span>
-                  <span>{setLine(e.t, s)}</span>
+                  <span style={{ color: s.drop ? C.gold : C.dim, width:20 }}>{s.drop ? "↓" : i+1}</span>
+                  <span style={{ flex:1 }}>{setLine(e.t, s)}</span>
+                  {es && es.sets[i] && es.sets[i].why && es.sets[i].why !== "drop" && <span style={{ fontSize:10, color: es.sets[i].why === "junk" ? C.warn : C.dim, alignSelf:"center" }}>{es.sets[i].why}</span>}
                 </div>
               ))}
-              {e.sets.length > 0 && e.t === "wr" && <div style={{ fontSize:11, color:C.dim, marginTop:6 }}>best e1RM: {Math.round(Math.max(...e.sets.map(x => e1rm(x.w, x.r))))}kg</div>}
+              {e.sets.length > 0 && e.t === "wr" && <div style={{ fontSize:11, color:C.dim, marginTop:6 }}>best e1RM: {Math.round(Math.max(...e.sets.map(x => e1rm(x.w, x.r))))}kg{nDrops ? ` · ${workSets(e.sets).length} working set${workSets(e.sets).length===1?"":"s"} + ${nDrops} drop${nDrops===1?"":"s"}` : ""}</div>}
+              {repBest > 0 && <div style={{ fontSize:11, color:C.dim, marginTop:6 }}>best e1RM (BW + load): {Math.round(repBest)}kg{nDrops ? ` · ${nDrops} drop${nDrops===1?"":"s"}` : ""}</div>}
+              {e.t !== "wr" && !repBest && nDrops > 0 && <div style={{ fontSize:11, color:C.dim, marginTop:6 }}>{workSets(e.sets).length} working set{workSets(e.sets).length===1?"":"s"} + {nDrops} drop{nDrops===1?"":"s"}</div>}
             </div>
             {e.note && <div style={{ fontSize:13, color:C.gold, marginTop:8, fontStyle:"italic" }}>“{e.note}”</div>}
           </div>
         );
-      })}
+      }); })()}
       {(session.injuries||[]).length > 0 && (
         <div style={{ ...card, borderColor:"#3A2A2A" }}>
           <div style={{ fontSize:12, color:C.dim, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Injuries logged</div>
@@ -1276,9 +1573,46 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey }) {
     </div>
   );
 }
+/* EWS summary card for a session: total + breakdown + expandable formula */
+function EwsCard({ ews, showFormula, setShowFormula }) {
+  const junk = ews.ex.reduce((a, x) => a + x.junk, 0);
+  const part = (label, v, color) => (
+    <div style={{ flex:1, textAlign:"center" }}>
+      <div style={{ fontSize:15, fontWeight:700, color }}>{v >= 0 ? "" : "-"}{fmtEws(Math.abs(v))}</div>
+      <div style={{ fontSize:10, color:C.dim }}>{label}</div>
+    </div>
+  );
+  return (
+    <div style={{ ...card, borderColor:"#3A3323" }}>
+      <div style={{ display:"flex", alignItems:"baseline", gap:10 }}>
+        <div style={{ fontSize:28, fontWeight:800, color:EWS_COLOR, letterSpacing:-0.5 }}>{fmtEws(ews.total)}</div>
+        <div style={{ fontSize:12, color:C.dim }}>EWS · Estimated Workout Score</div>
+        <button onClick={() => setShowFormula(f => !f)} style={{ marginLeft:"auto", background:"transparent", border:`1px solid ${C.line}`, color:C.dim, borderRadius:10, padding:"1px 8px", fontSize:10, cursor:"pointer" }}>{showFormula ? "hide" : "formula"}</button>
+      </div>
+      <div style={{ display:"flex", gap:6, marginTop:8 }}>
+        {part("base (sets × muscle × quality)", ews.base, C.ink)}
+        {part("vs last session", ews.improve, ews.improve >= 0 ? C.acc : C.warn)}
+        {part("PR bonus", ews.pr, C.gold)}
+      </div>
+      {junk > 0 && <div style={{ fontSize:11, color:C.warn, marginTop:8 }}>{junk} junk set{junk===1?"":"s"} scored at {Math.round(EWS.junkCredit*100)}%</div>}
+      {showFormula && (
+        <div style={{ fontSize:11, color:C.dim, marginTop:10, lineHeight:1.5 }}>
+          <div><b style={{ color:C.ink }}>base</b> = Σ sets {EWS.perSet} × muscle weight × quality</div>
+          <div style={{ paddingLeft:10 }}>muscle weight: quads {MUSCLE_WEIGHT.Quads} · glutes {MUSCLE_WEIGHT.Glutes} · back {MUSCLE_WEIGHT.Back} · chest {MUSCLE_WEIGHT.Chest} · hams {MUSCLE_WEIGHT.Hamstrings} · delts {MUSCLE_WEIGHT.Shoulders} · tris {MUSCLE_WEIGHT.Triceps} · bis {MUSCLE_WEIGHT.Biceps} · calves {MUSCLE_WEIGHT.Calves} · core {MUSCLE_WEIGHT.Core} · forearms {MUSCLE_WEIGHT.Forearms}</div>
+          <div style={{ paddingLeft:10 }}>quality: full set 1.0 · drop row {EWS.dropCredit} · light (50–70% of top load) {EWS.lightCredit} · junk (&lt;50% of top load, or under half the target reps/weight) {EWS.junkCredit}</div>
+          <div style={{ paddingLeft:10 }}>if RPE logged: ≥{EWS.rpe.hard} → 1.0 · {EWS.rpe.mid} → {EWS.rpe.midCredit} · ≤{EWS.rpe.mid-1} → {EWS.rpe.easyCredit}</div>
+          <div><b style={{ color:C.ink }}>vs last</b> = Σ exercises {EWS.perSet} × muscle weight × {EWS.lastPerPct} × %Δ best e1RM vs your previous session of it (floor {EWS.lastFloorPct}%)</div>
+          <div><b style={{ color:C.ink }}>PR</b> = Σ exercises {EWS.perSet} × muscle weight × {EWS.prPerPct} × % over your prior all-time best</div>
+          <div style={{ marginTop:4 }}>e1RM = Epley on the best set; bodyweight moves use bodyweight + load, so 8→10 reps is +5%, not +25%; holds use 1 + sec/120. No cap: more quality sets and bigger jumps always score higher.</div>
+        </div>
+      )}
+    </div>
+  );
+}
 function setLine(t, s) {
-  if (t === "wr") return `${s.w} kg × ${s.r}${s.rpe!=null ? ` @ RPE ${s.rpe}` : ""}`;
-  if (t === "rep") return `${s.r} reps${s.rpe!=null ? ` @ RPE ${s.rpe}` : ""}`;
+  const dp = s.drop ? "drop · " : "";
+  if (t === "wr") return `${dp}${s.w} kg × ${s.r}${s.rpe!=null ? ` @ RPE ${s.rpe}` : ""}`;
+  if (t === "rep") return `${dp}${s.r} reps${isLoadedSet(s) ? ` ${fmtAdd(s.add)}` : ""}${s.rpe!=null ? ` @ RPE ${s.rpe}` : ""}`;
   if (t === "time") return `${s.sec} s`;
   if (t === "wd") return `${s.w} kg · ${s.dist} m`;
   return `${Math.round((s.sec||0)/60)} min · ${s.dist} km`;
@@ -1298,18 +1632,38 @@ function useExMap(sessions, allEx) {
 }
 
 // per-exercise session history + progression metric (shared by drill-down)
+/* For bodyweight exercises: once any session has a loaded set (+kg or
+   assisted) AND a bodyweight is known somewhere, the metric switches to
+   e1RM on (bodyweight + load) for every session, so the chart stays one
+   quantity. With no loads anywhere it stays max reps. */
+function repLoadedMode(sessions, picked) {
+  let loaded = false, bw = false;
+  sessions.forEach(s => {
+    if (s.bodyweight) bw = true;
+    const e = s.entries.find(x => x.key === picked);
+    if (e && e.sets.some(isLoadedSet)) loaded = true;
+  });
+  return loaded && bw;
+}
 function exerciseHistory(sessions, picked, ex) {
   if (!ex) return [];
-  return sessions.map(s => {
+  const loadedMode = ex.t === "rep" && repLoadedMode(sessions, picked);
+  return sessions.map((s, si) => {
     const e = s.entries.find(x => x.key === picked);
     if (!e || !e.sets.length) return null;
     let metric = 0, label = "";
     if (ex.t === "wr") { metric = Math.round(Math.max(...e.sets.map(x => e1rm(x.w, x.r)))); label = metric + " e1RM"; }
+    else if (ex.t === "rep" && loadedMode) {
+      const bw = bwForSession(sessions, si);
+      // unloaded sets still count: load = bw + 0
+      metric = Math.round(Math.max(...e.sets.map(x => bw ? e1rm(bw + (Number(x.add) || 0), x.r) : 0)));
+      label = metric + " e1RM";
+    }
     else if (ex.t === "rep") { metric = Math.max(...e.sets.map(x => x.r||0)); label = metric + " reps"; }
     else if (ex.t === "time") { metric = Math.max(...e.sets.map(x => x.sec||0)); label = metric + "s"; }
     else if (ex.t === "wd") { metric = Math.max(...e.sets.map(x => x.w||0)); label = metric + "kg"; }
     else { metric = Math.round(e.sets.reduce((a, x) => a + (x.dist||0), 0)*10)/10; label = metric + "km"; }
-    return { date: s.date, metric, label, sets: e.sets, note: e.note, t: ex.t };
+    return { date: s.date, metric, label, sets: e.sets, note: e.note, t: ex.t, loadedMode };
   }).filter(Boolean);
 }
 
@@ -1317,8 +1671,18 @@ function exerciseHistory(sessions, picked, ex) {
 function ExerciseDetail({ sessions, exMap, exKey, onBack }) {
   const ex = exMap.get(exKey);
   const history = useMemo(() => exerciseHistory(sessions, exKey, ex), [sessions, exKey, ex]);
-  const series = history.filter(h => h.metric > 0).map(h => ({ date: h.date, v: h.metric }));
-  const unit = ex ? ({ wr:"kg e1RM", rep:"reps", time:"s", wd:"kg", cardio:"km" }[ex.t]) : "";
+  // PR = new running max, skipping the first session (baseline, not a PR)
+  const withPr = useMemo(() => {
+    let runMax = -Infinity;
+    return history.map((h, i) => {
+      const pr = i > 0 && h.metric > runMax && h.metric > 0;
+      if (h.metric > runMax) runMax = h.metric;
+      return { ...h, pr };
+    });
+  }, [history]);
+  const series = withPr.filter(h => h.metric > 0).map(h => ({ date: h.date, v: h.metric, pr: h.pr }));
+  const loadedMode = history.length > 0 && history[0].loadedMode;
+  const unit = ex ? (loadedMode ? "kg e1RM (BW+load)" : { wr:"kg e1RM", rep:"reps", time:"s", wd:"kg", cardio:"km" }[ex.t]) : "";
   const first = series[0]?.v, last = series[series.length-1]?.v;
   const delta = (first && last) ? Math.round((last - first) / first * 1000)/10 : null;
 
@@ -1332,18 +1696,11 @@ function ExerciseDetail({ sessions, exMap, exKey, onBack }) {
           ["Change", delta!=null ? (delta >= 0 ? "+" : "") + delta + "%" : "—"]
         ]} />
       )}
-      <Line title="Progression" data={series} color={C.acc} unit={unit} />
+      <Line title="Progression" data={series} color={C.acc} unit={unit} marks={series.map(d => d.pr)} markLabel="PR" />
       <div style={{ ...card }}>
         <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Every session</div>
         {history.length === 0 && <div style={{ fontSize:12, color:C.dim }}>No sets logged yet.</div>}
         {(() => {
-          // flag sessions where the metric set a new running max (skip the first — baseline, not a PR)
-          let runMax = -Infinity;
-          const withPr = history.map((h, i) => {
-            const pr = i > 0 && h.metric > runMax && h.metric > 0;
-            if (h.metric > runMax) runMax = h.metric;
-            return { ...h, pr };
-          });
           return withPr.slice().reverse().map((h, i) => (
             <div key={i} style={{ padding:"8px 0", borderBottom: i < history.length-1 ? `1px solid ${C.line}` : "none" }}>
               <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline" }}>
@@ -1409,7 +1766,23 @@ function DetailHeader({ title, sub, onBack }) {
 }
 
 /* Aggregate overview: totals, volume, bodyweight, feel, sessions/week. */
-function TrendsOverview({ sessions }) {
+function TrendsOverview({ sessions, scoreOf }) {
+  const ewsSeries = useMemo(() => {
+    const sorted = sessions.slice().sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+    let runMax = -Infinity;
+    return sorted.map(s => {
+      const v = Math.round(scoreOf(s).total);
+      const pr = v > runMax && runMax !== -Infinity;
+      if (v > runMax) runMax = v;
+      return { date: s.date, v, pr };
+    }).filter(d => d.v > 0);
+  }, [sessions, scoreOf]);
+  const ewsStats = useMemo(() => {
+    if (!ewsSeries.length) return null;
+    const vals = ewsSeries.map(d => d.v);
+    const recent = vals.slice(-6);
+    return { last: vals[vals.length-1], best: Math.max(...vals), avg: Math.round(recent.reduce((a, b) => a + b, 0) / recent.length) };
+  }, [ewsSeries]);
   const weekCounts = useMemo(() => {
     const m = {}; sessions.forEach(s => { const w = isoWeek(s.date); m[w] = (m[w]||0)+1; });
     return Object.entries(m).sort();
@@ -1420,6 +1793,8 @@ function TrendsOverview({ sessions }) {
   return (
     <div>
       <Stat row={[["Sessions", sessions.length], ["Weeks active", weekCounts.length], ["Avg/wk", weekCounts.length ? (sessions.length/weekCounts.length).toFixed(1) : "0"]]} />
+      {ewsStats && <Stat row={[["EWS last", ewsStats.last], ["EWS best", ewsStats.best], ["Avg last 6", ewsStats.avg]]} />}
+      <Line title="EWS · Estimated Workout Score" data={ewsSeries} color={EWS_COLOR} unit="" marks={ewsSeries.map(d => d.pr)} markLabel="new best" />
       <Line title="Session volume (kg·reps)" data={volSeries} color={C.blue} unit="" />
       {bwSeries.length > 0 && <Line title="Bodyweight" data={bwSeries} color={C.warn} unit="kg" />}
       {feelSeries.length > 0 && <Line title="Readiness / feel (1–10)" data={feelSeries} color={C.acc} unit="" />}
@@ -1435,7 +1810,7 @@ function MuscleDetail({ sessions, muscle, exResolve, onBack, onPickExercise }) {
     const byWeek = {};
     sessions.forEach(s => {
       let n = 0;
-      s.entries.forEach(e => { if (muscleOfEntry(e, exResolve) === muscle) n += (e.sets ? e.sets.length : 0); });
+      s.entries.forEach(e => { if (muscleOfEntry(e, exResolve) === muscle) n += workSets(e.sets).length; });
       if (n > 0) { const w = isoWeek(s.date); byWeek[w] = (byWeek[w] || 0) + n; }
     });
     return Object.entries(byWeek).sort().map(([wk, v]) => ({ date: wk, v }));
@@ -1448,7 +1823,7 @@ function MuscleDetail({ sessions, muscle, exResolve, onBack, onPickExercise }) {
         .filter(e => muscleOfEntry(e, exResolve) === muscle && e.sets && e.sets.length)
         .map(e => ({ key:e.key, name:e.name, t:e.t, sets:e.sets }));
       if (!items.length) return null;
-      const total = items.reduce((a, e) => a + e.sets.length, 0);
+      const total = items.reduce((a, e) => a + workSets(e.sets).length, 0);
       return { id:s.id, date:s.date, dayName:s.dayName, total, items };
     }).filter(Boolean).sort((a, b) => a.date < b.date ? 1 : -1);
   }, [sessions, muscle, exResolve]);
@@ -1507,7 +1882,7 @@ function MuscleList({ sessions, exResolve, onPick }) {
 
 /* Trends — segmented: Overview / Exercises / Muscles, each with drill-downs.
    Also keeps the current-week & trailing-4wk landmark view under Muscles. */
-function Trends({ sessions, allEx, exResolve }) {
+function Trends({ sessions, allEx, exResolve, scoreOf }) {
   const [view, setView] = useState("overview"); // overview | exercises | muscles
   const [exKey, setExKey] = useState(null);      // exercise drill-down
   const [muscle, setMuscle] = useState(null);    // muscle drill-down
@@ -1533,7 +1908,7 @@ function Trends({ sessions, allEx, exResolve }) {
             border:`1px solid ${view===k ? C.acc : C.line}`, borderRadius:8, padding:"9px 0", fontSize:13, fontWeight:600, cursor:"pointer" }}>{lbl}</button>
         ))}
       </div>
-      {view === "overview" && <TrendsOverview sessions={sessions} />}
+      {view === "overview" && <TrendsOverview sessions={sessions} scoreOf={scoreOf} />}
       {view === "exercises" && <ExerciseList sessions={sessions} exMap={exMap} onPick={setExKey} />}
       {view === "muscles" && <MuscleVolumeSection sessions={sessions} exResolve={exResolve} onPickMuscle={setMuscle} />}
     </div>
@@ -1562,13 +1937,14 @@ function muscleOfEntry(e, exResolve) {
   return LIB_BY_NAME.get(e.name) || null;
 }
 
-// count working sets per muscle across a list of sessions. one logged set = 1.
+// count working sets per muscle across a list of sessions. one logged set = 1;
+// a top set plus its drops = 1 (RP convention), so drop rows are excluded.
 function setsByMuscle(sessionList, exResolve) {
   const out = {};
   sessionList.forEach(s => s.entries.forEach(e => {
     const mus = muscleOfEntry(e, exResolve);
     if (!mus) return;
-    out[mus] = (out[mus] || 0) + (e.sets ? e.sets.length : 0);
+    out[mus] = (out[mus] || 0) + workSets(e.sets).length;
   }));
   return out;
 }
@@ -2284,7 +2660,7 @@ function Stat({ row }) {
     </div>
   );
 }
-function Line({ title, data, color, unit, header, embedded }) {
+function Line({ title, data, color, unit, header, embedded, marks, markLabel }) {
   const W = 320, H = 120, pad = 8;
   const vals = data.map(d => d.v);
   const min = Math.min(...vals, 0), max = Math.max(...vals, 1);
@@ -2305,8 +2681,16 @@ function Line({ title, data, color, unit, header, embedded }) {
         ? <div style={{ fontSize:12, color:C.dim, padding:"10px 0" }}>No data yet.</div>
         : <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:"auto", display:"block" }}>
             <path d={path} fill="none" stroke={color} strokeWidth="2" />
-            {pts.map((p, i) => <circle key={i} cx={p[0]} cy={p[1]} r="2.5" fill={color} />)}
+            {pts.map((p, i) => marks && marks[i]
+              ? <g key={i}><circle cx={p[0]} cy={p[1]} r="6" fill="none" stroke={C.gold} strokeWidth="1.5" /><circle cx={p[0]} cy={p[1]} r="3" fill={C.gold} /></g>
+              : <circle key={i} cx={p[0]} cy={p[1]} r="2.5" fill={color} />)}
           </svg>}
+      {marks && marks.some(Boolean) && (
+        <div style={{ fontSize:10, color:C.dim, marginTop:4, display:"flex", alignItems:"center", gap:5 }}>
+          <span style={{ display:"inline-block", width:8, height:8, borderRadius:4, background:C.gold, boxShadow:`0 0 0 2px ${C.panel}, 0 0 0 3px ${C.gold}` }} />
+          {markLabel || "PR"} · {marks.filter(Boolean).length} of {data.length}
+        </div>
+      )}
     </>
   );
   return embedded ? <div>{body}</div> : <div style={card}>{body}</div>;

@@ -978,12 +978,37 @@
              pctOfMav: mav ? Math.round((sets / mav) * 100) : null };
   }
 
+  /* ==========================================================
+     EWS (Estimated Workout Score) constants
+     Muscle-size weights: relative to Shoulders = 1.0, roughly by muscle
+     mass / recovery cost. A set of quads is worth more than a set of
+     forearms. Cardio and mobility score low per "set" so they don't swamp
+     a lifting session. Tune here, not in app.js.
+     ========================================================== */
+  const MUSCLE_WEIGHT = {
+    Quads: 1.6, Glutes: 1.5, Back: 1.4, Hamstrings: 1.2, Chest: 1.2,
+    Shoulders: 1.0, Triceps: 0.8, Biceps: 0.7, Calves: 0.7, Core: 0.6,
+    Forearms: 0.4, Cardio: 0.4, "Mobility/Rehab": 0.2
+  };
+  const EWS = {
+    perSet: 5,          // points for one full-quality working set at weight 1.0
+    dropCredit: 0.5,    // a drop row is worth half a set (not junk, but not a fresh set)
+    junkCredit: 0.15,   // junk set credit (<50% of top load, or far off target)
+    lightCredit: 0.6,   // 50-70% of top load: light but not junk
+    rpe: { hard: 7, mid: 6, midCredit: 0.6, easyCredit: 0.25 }, // when RPE is logged
+    lastPerPct: 0.5,    // points per % e1RM change vs last session, x perSet x weight
+    lastFloorPct: -10,  // regression vs last is capped at -10% (a bad day can't nuke the score)
+    prPerPct: 1.0       // points per % over all-time best, x perSet x weight
+  };
+
   window.GymData = {
     MUSCLES, LIB, T, rpHint, defaultProgram,
+    // EWS scoring constants
+    MUSCLE_WEIGHT, EWS,
     // mesocycle engine
     LANDMARKS, GOALS, SPLITS,
     splitsForDays, generateProgram, applyWeek, mesoStatus,
-    rampSets, rirTarget, seedWeight, est1RM,
+    rampSets, rirTarget, seedWeight, est1RM, roundLoad,
     // progression + strength engine
     suggestNext, incFor, generate531, WAVE_531,
     // volume landmark banding
