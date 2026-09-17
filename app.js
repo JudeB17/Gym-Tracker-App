@@ -105,6 +105,57 @@ function migrateSession(s) {
   return s;
 }
 
+/* ============================================================
+   Rest timer preferences + alerts
+   prefs:rest = { len, step, notify, sound, vibrate, byEx:{ [exKey]: sec } }
+   Alerts fire from the page. There is no web API that schedules a local
+   notification while the page is suspended, so on iPhone the alert lands
+   while the app is on screen (or for a few seconds after backgrounding);
+   if the phone locks, it fires the moment the app is reopened.
+   ============================================================ */
+const REST_DEFAULTS = { len: 120, step: 30, notify: false, sound: true, vibrate: true, byEx: {} };
+const REST_PRESETS = [0, 60, 90, 120, 150, 180, 240, 300];
+const notifSupported = () => typeof Notification !== "undefined" && "requestPermission" in Notification;
+const notifState = () => notifSupported() ? Notification.permission : "unsupported";
+let _audio = null;
+function ensureAudio() {
+  // must be called from a user gesture so iOS lets the context run
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    if (!_audio) _audio = new AC();
+    if (_audio.state === "suspended") _audio.resume();
+  } catch (e) {}
+}
+function beep() {
+  try {
+    if (!_audio) return;
+    const t0 = _audio.currentTime;
+    [0, 0.22, 0.44].forEach((d, i) => {
+      const o = _audio.createOscillator(), g = _audio.createGain();
+      o.type = "sine"; o.frequency.value = i === 2 ? 1046 : 784;
+      g.gain.setValueAtTime(0.0001, t0 + d); g.gain.exponentialRampToValueAtTime(0.35, t0 + d + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d + 0.16);
+      o.connect(g); g.connect(_audio.destination); o.start(t0 + d); o.stop(t0 + d + 0.18);
+    });
+  } catch (e) {}
+}
+async function showRestNotification(body) {
+  if (notifState() !== "granted") return;
+  const opts = { body, tag: "rest-timer", renotify: true, silent: false };
+  try {
+    if (navigator.serviceWorker) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg && reg.showNotification) { await reg.showNotification("Rest over", opts); return; }
+    }
+  } catch (e) {}
+  try { new Notification("Rest over", opts); } catch (e) {}
+}
+function fireRestAlert(prefs, body) {
+  if (prefs.vibrate && navigator.vibrate) navigator.vibrate([180, 80, 180]);
+  if (prefs.sound) beep();
+  if (prefs.notify) showRestNotification(body);
+}
+const fmtRest = sec => !sec ? "off" : (sec >= 60 ? `${Math.floor(sec/60)}:${String(sec%60).padStart(2,"0")}` : `${sec}s`);
+
 const exMapFromLib = () => { const m = new Map(); LIB.forEach(e => m.set(e.key, e)); return m; };
 
 /* ============================================================
@@ -250,6 +301,8 @@ function App() {
   const exByKey = useCallback(k => allEx.find(e => e.key === k), [allEx]);
 
   const saveProgram = useCallback(async p => { setProgram(p); await sSet("program:current", p); }, []);
+  const [restPrefs, setRestPrefs] = useState(REST_DEFAULTS);
+  const saveRestPrefs = useCallback(patch => setRestPrefs(prev => { const next = { ...prev, ...(typeof patch === "function" ? patch(prev) : patch) }; sSet("prefs:rest", next); return next; }), []);
   /* EWS for any session against the current session list + program targets */
   const scoreOf = useCallback(s => scoreSession(s, sessions, exByKey, program ? program.days : null), [sessions, exByKey, program]);
 
@@ -284,6 +337,11 @@ function App() {
         setInjuries((await sGet("injuries:list")) || []);
         setGyms((await sGet("gyms:list")) || []);
         lastGym.current = (await sGet("gyms:last")) || null;
+        {
+          const rp = await sGet("prefs:rest");
+          const legacy = await sGet("prefs:restLen"); // pre-Sep-2026 single value
+          setRestPrefs({ ...REST_DEFAULTS, ...(rp || {}), ...(rp == null && legacy != null ? { len: legacy } : {}) });
+        }
         const idx = (await sGet("sessions:index")) || [];
         const out = [];
         for (const id of idx) { const s = await sGet(`session:${id}`); if (s) out.push(migrateSession(s)); }
@@ -711,7 +769,7 @@ function App() {
       <div style={{ padding: "0 14px 120px" }}>
         {tab === "log" && (
           draft
-            ? <DraftView draft={draft} setDraft={setDraft} onSave={saveSession} onDiscard={discardDraft}
+            ? <DraftView draft={draft} setDraft={setDraft} onSave={saveSession} onDiscard={discardDraft} restPrefs={restPrefs} saveRestPrefs={saveRestPrefs}
                 lastForExercise={lastForExercise} exByKey={exByKey} gyms={gyms}
                 onAddExercise={() => openPicker(k => { addExerciseToDraft(k); setPicker(null); })} />
             : <StartView program={program} activeDayId={activeDayId} setActiveDayId={setActiveDayId} onStart={startSession} sessions={sessions} />
@@ -727,7 +785,7 @@ function App() {
         {tab === "program" && <ProgramEditor program={program} setProgram={saveProgram} exByKey={exByKey}
           openPicker={openPicker} custom={custom} removeCustom={removeCustom} updateCustom={updateCustom}
           exportJson={exportJson} importJson={importJson} onReset={resetProgram}
-          onAdvanceWeek={advanceWeek} onExitMeso={exitMeso} />}
+          onAdvanceWeek={advanceWeek} onExitMeso={exitMeso} restPrefs={restPrefs} saveRestPrefs={saveRestPrefs} />}
       </div>
       {picker && <Picker custom={custom} onAddCustom={addCustom} onPick={picker.onPick} initialQ={picker.initialQ} onClose={() => setPicker(null)} />}
       {toast && <div style={{ position:"fixed", bottom:"calc(76px + env(safe-area-inset-bottom))", left:"50%", transform:"translateX(-50%)", background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:20, padding:"8px 18px", fontSize:13, zIndex:70, whiteSpace:"nowrap" }}>{toast}</div>}
@@ -866,7 +924,7 @@ function StartView({ program, activeDayId, setActiveDayId, onStart, sessions }) 
 /* ============================================================
    Draft (logging) — with drag reorder + per-exercise notes
    ============================================================ */
-function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKey, onAddExercise, gyms }) {
+function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKey, onAddExercise, gyms, restPrefs, saveRestPrefs }) {
   // ensure every entry has a stable id (handles drafts created before eid existed)
   useEffect(() => {
     if ((draft.entries || []).some(e => !e.eid)) {
@@ -889,21 +947,33 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
   }, [draft.startedAt]);
   const elapsedMin = draft.startedAt ? Math.max(0, Math.round((nowTick - draft.startedAt) / 60000)) : null;
 
-  /* rest timer: fires when a set is marked done. length pref persisted. */
-  const [restLen, setRestLen] = useState(120); // 0 = off
+  /* rest timer: fires when a set is marked done. Length = per-exercise
+     override if set, else the default from settings. Alerts (notification /
+     sound / vibrate) fire from a setTimeout at the exact end, plus a
+     late-fire check when the page comes back to the foreground. */
   const [restEnd, setRestEnd] = useState(null);
-  const restLenRef = useRef(120);
-  useEffect(() => { restLenRef.current = restLen; }, [restLen]);
-  useEffect(() => { (async () => { const v = await sGet("prefs:restLen"); if (v != null) setRestLen(v); })(); }, []);
-  const cycleRest = () => {
-    const order = [0, 90, 120, 180];
-    const next = order[(order.indexOf(restLen) + 1) % order.length];
-    setRestLen(next); sSet("prefs:restLen", next);
-    if (next === 0) setRestEnd(null);
-  };
-  const startRest = useCallback(() => {
-    if (restLenRef.current > 0) setRestEnd(Date.now() + restLenRef.current * 1000);
+  const [restFor, setRestFor] = useState(""); // exercise name shown in the alert
+  const [picker, setPicker] = useState(null); // null | { scope:"default" } | { scope:"ex", key, name }
+  const prefsRef = useRef(restPrefs);
+  useEffect(() => { prefsRef.current = restPrefs; }, [restPrefs]);
+  const restLenFor = key => { const o = restPrefs.byEx && restPrefs.byEx[key]; return o != null ? o : restPrefs.len; };
+  const startRest = useCallback((entry) => {
+    const p = prefsRef.current;
+    const o = entry && p.byEx && p.byEx[entry.key];
+    const len = o != null ? o : p.len;
+    if (len > 0) { setRestEnd(Date.now() + len * 1000); setRestFor(entry ? entry.name : ""); }
   }, []);
+  const alerted = useRef(null);
+  useEffect(() => {
+    if (!restEnd) { alerted.current = null; return; }
+    const fire = () => { if (alerted.current === restEnd) return; alerted.current = restEnd; fireRestAlert(prefsRef.current, restFor ? `${restFor}: next set` : "Next set"); };
+    const ms = restEnd - Date.now();
+    if (ms <= 0) { fire(); return; }
+    const t = setTimeout(fire, ms);
+    const onVis = () => { if (document.visibilityState === "visible" && Date.now() >= restEnd) fire(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearTimeout(t); document.removeEventListener("visibilitychange", onVis); };
+  }, [restEnd, restFor]);
   const draftRef = useRef(draft);
   useEffect(() => { draftRef.current = draft; }, [draft]);
   /* Rest only fires when the block is actually over:
@@ -917,7 +987,8 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
       const at = ents.findIndex(e => e.eid === entry.eid);
       if (ents.some((e, j) => j > at && e.group === entry.group)) return;
     }
-    startRest();
+    ensureAudio(); // user gesture: unlock audio for the beep later
+    startRest(entry);
   }, [startRest]);
 
   /* ---- supersets (ad hoc, per session) ----
@@ -987,8 +1058,8 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
             {elapsedMin != null && <> · <span style={{ color:C.ink, fontWeight:600 }}>{fmtDur(elapsedMin)}</span></>}
             {totalSets > 0 && <> · {doneSets}/{totalSets} sets done</>}
           </div>
-          <button onClick={cycleRest} style={{ background:C.bg, border:`1px solid ${C.line}`, color: restLen ? C.acc : C.dim, borderRadius:12, padding:"3px 10px", fontSize:11, fontWeight:600, cursor:"pointer" }}>
-            rest {restLen ? `${restLen}s` : "off"}
+          <button onClick={() => setPicker({ scope:"default" })} style={{ background:C.bg, border:`1px solid ${C.line}`, color: restPrefs.len ? C.acc : C.dim, borderRadius:12, padding:"3px 10px", fontSize:11, fontWeight:600, cursor:"pointer" }}>
+            rest {fmtRest(restPrefs.len)}
           </button>
         </div>
         <GymPicker gym={draft.gym} gyms={gyms || []} onSet={g => setDraft(d => ({ ...d, gym: g }))} />
@@ -1002,6 +1073,8 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
         render={(e, i, dragHandle) => (
           <ExerciseCard entry={e} setEntry={setEntry} rmEntry={rmEntry} prev={lastForExercise(e.key)} ex={exByKey(e.key)} dragHandle={dragHandle} onSetDone={onSetDone}
             ss={groupInfo(e)} pairing={pairing}
+            restOverride={restPrefs.byEx && restPrefs.byEx[e.key]}
+            onRestPick={() => setPicker({ scope:"ex", key: e.key, name: e.name })}
             onPairStart={() => setPairing(p => p === e.eid ? null : e.eid)}
             onPairWith={() => pairWith(e.eid)}
             onUnlink={() => unlink(e.eid)} />
@@ -1029,7 +1102,19 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
         </div>
       )}
 
-      {restEnd && <RestPill endAt={restEnd} onExtend={() => setRestEnd(t => t + 30000)} onClear={() => setRestEnd(null)} />}
+      {restEnd && <RestPill endAt={restEnd} step={restPrefs.step || 30} label={restFor} onExtend={() => setRestEnd(t => t + (restPrefs.step || 30) * 1000)} onClear={() => setRestEnd(null)} />}
+      {picker && (
+        <RestPicker
+          title={picker.scope === "ex" ? picker.name : "Default rest"}
+          value={picker.scope === "ex" ? (restPrefs.byEx && restPrefs.byEx[picker.key] != null ? restPrefs.byEx[picker.key] : null) : restPrefs.len}
+          fallback={picker.scope === "ex" ? restPrefs.len : null}
+          onPick={v => {
+            if (picker.scope === "ex") saveRestPrefs(p => { const byEx = { ...(p.byEx || {}) }; if (v == null) delete byEx[picker.key]; else byEx[picker.key] = v; return { byEx }; });
+            else { saveRestPrefs({ len: v }); if (v === 0) setRestEnd(null); }
+            setPicker(null);
+          }}
+          onClose={() => setPicker(null)} />
+      )}
     </div>
   );
 }
@@ -1069,16 +1154,12 @@ function GymPicker({ gym, gyms, onSet }) {
 }
 
 /* floating rest countdown, sits above the bottom nav */
-function RestPill({ endAt, onExtend, onClear }) {
+function RestPill({ endAt, onExtend, onClear, step, label }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 500); return () => clearInterval(t); }, []);
   const rem = Math.max(0, Math.ceil((endAt - now) / 1000));
   const finished = rem === 0;
-  const buzzed = useRef(false);
-  useEffect(() => {
-    if (finished && !buzzed.current) { buzzed.current = true; if (navigator.vibrate) navigator.vibrate([180, 80, 180]); }
-    if (!finished) buzzed.current = false;
-  }, [finished]);
+  // alerts (vibrate / sound / notification) fire from DraftView's timeout, not here
   return (
     <div style={{ position:"fixed", bottom:"calc(64px + env(safe-area-inset-bottom))", left:"50%", transform:"translateX(-50%)",
       display:"flex", alignItems:"center", gap:12, zIndex:60,
@@ -1088,8 +1169,116 @@ function RestPill({ endAt, onExtend, onClear }) {
       <span style={{ fontSize:15, fontWeight:800, fontVariantNumeric:"tabular-nums", minWidth:44 }}>
         {finished ? "GO" : fmtSec(rem)}
       </span>
-      {!finished && <button onClick={onExtend} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.ink, borderRadius:12, padding:"2px 10px", fontSize:12, fontWeight:600, cursor:"pointer" }}>+30s</button>}
+      {!finished && label && <span style={{ fontSize:11, color:C.dim, maxWidth:110, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{label}</span>}
+      {!finished && <button onClick={onExtend} style={{ background:"transparent", border:`1px solid ${C.line}`, color:C.ink, borderRadius:12, padding:"2px 10px", fontSize:12, fontWeight:600, cursor:"pointer" }}>+{step}s</button>}
       <button onClick={onClear} style={{ background:"transparent", border:"none", color:"inherit", fontSize:17, cursor:"pointer", padding:0, lineHeight:1 }}>×</button>
+    </div>
+  );
+}
+
+/* bottom sheet: presets + 15 s stepper. value null = "use default" (per-exercise scope) */
+function RestPicker({ title, value, fallback, onPick, onClose }) {
+  const [v, setV] = useState(value == null ? (fallback != null ? fallback : 120) : value);
+  const chip = (sec, on) => ({ background: on ? C.acc : C.bg, color: on ? "#04150E" : C.ink, border:`1px solid ${on ? C.acc : C.line}`, borderRadius:12, padding:"7px 0", fontSize:13, fontWeight:700, cursor:"pointer", flex:"1 1 21%", minWidth:60 });
+  const stepBtn = { background:C.panel2, color:C.ink, border:`1px solid ${C.line}`, borderRadius:10, width:52, height:44, fontSize:20, fontWeight:700, cursor:"pointer" };
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.55)", zIndex:80, display:"flex", alignItems:"flex-end" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.panel, borderTop:`1px solid ${C.line}`, borderRadius:"16px 16px 0 0", padding:"14px 16px calc(18px + env(safe-area-inset-bottom))", width:"100%" }}>
+        <div style={{ display:"flex", alignItems:"baseline", justifyContent:"space-between" }}>
+          <div style={{ fontSize:14, fontWeight:700 }}>{title}</div>
+          <div style={{ fontSize:11, color:C.dim }}>{fallback != null ? `default ${fmtRest(fallback)}` : "rest between sets"}</div>
+        </div>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:14, margin:"14px 0" }}>
+          <button onClick={() => setV(x => Math.max(0, x - 15))} style={stepBtn}>−</button>
+          <div style={{ fontSize:34, fontWeight:800, fontVariantNumeric:"tabular-nums", minWidth:110, textAlign:"center", color: v ? C.ink : C.dim }}>{fmtRest(v)}</div>
+          <button onClick={() => setV(x => Math.min(900, x + 15))} style={stepBtn}>+</button>
+        </div>
+        <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+          {REST_PRESETS.map(sec => <button key={sec} onClick={() => setV(sec)} style={chip(sec, sec === v)}>{fmtRest(sec)}</button>)}
+        </div>
+        <div style={{ display:"flex", gap:8, marginTop:14 }}>
+          {fallback != null && <button onClick={() => onPick(null)} style={{ ...btn(C.panel2, C.ink), flex:1 }}>Use default</button>}
+          <button onClick={() => onPick(v)} style={{ ...btn(C.acc, "#04150E"), flex:2 }}>Set {fmtRest(v)}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* settings card for the rest timer + alerts (lives in the Program tab) */
+function RestSettings({ prefs, save }) {
+  const [perm, setPerm] = useState(notifState());
+  const [picker, setPicker] = useState(false);
+  const [testMsg, setTestMsg] = useState("");
+  const row = { display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 0", borderBottom:`1px solid ${C.line}` };
+  const Toggle = ({ on, onChange, disabled }) => (
+    <button disabled={disabled} onClick={() => onChange(!on)} style={{ width:46, height:26, borderRadius:13, border:"none", cursor: disabled ? "default" : "pointer", opacity: disabled ? .4 : 1, background: on ? C.acc : C.line, position:"relative", padding:0 }}>
+      <span style={{ position:"absolute", top:3, left: on ? 23 : 3, width:20, height:20, borderRadius:10, background: on ? "#04150E" : C.ink, transition:"left .15s" }} />
+    </button>
+  );
+  const enableNotify = async on => {
+    if (!on) { save({ notify: false }); return; }
+    if (!notifSupported()) { setPerm("unsupported"); return; }
+    let p = Notification.permission;
+    if (p !== "granted") { try { p = await Notification.requestPermission(); } catch (e) { p = Notification.permission; } }
+    setPerm(p);
+    save({ notify: p === "granted" });
+  };
+  const test = () => { ensureAudio(); fireRestAlert(prefs, "Test alert"); setTestMsg("sent"); setTimeout(() => setTestMsg(""), 1500); };
+  const overrides = Object.entries(prefs.byEx || {});
+  const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent);
+  const standalone = window.matchMedia && window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  const permNote = perm === "granted" ? "allowed"
+    : perm === "denied" ? "blocked in system settings"
+    : perm === "unsupported" ? (isIOS && !standalone ? "iPhone: add to Home Screen first" : "not supported in this browser")
+    : "tap to allow";
+  return (
+    <div style={card}>
+      <div style={{ fontSize:12, color:C.dim, marginBottom:4, textTransform:"uppercase", letterSpacing:0.5 }}>Rest timer & alerts</div>
+      <div style={row}>
+        <div><div style={{ fontSize:14 }}>Default rest</div><div style={{ fontSize:11, color:C.dim }}>after each working set · per-exercise ⏱ overrides win</div></div>
+        <button onClick={() => setPicker(true)} style={{ background:C.bg, border:`1px solid ${C.line}`, color: prefs.len ? C.acc : C.dim, borderRadius:12, padding:"6px 12px", fontSize:13, fontWeight:700, cursor:"pointer" }}>{fmtRest(prefs.len)}</button>
+      </div>
+      <div style={row}>
+        <div><div style={{ fontSize:14 }}>Extend step</div><div style={{ fontSize:11, color:C.dim }}>the + button on the running timer</div></div>
+        <div style={{ display:"flex", gap:4 }}>
+          {[15, 30, 60].map(v => <button key={v} onClick={() => save({ step: v })} style={{ background: prefs.step === v ? C.acc : C.bg, color: prefs.step === v ? "#04150E" : C.ink, border:`1px solid ${prefs.step === v ? C.acc : C.line}`, borderRadius:10, padding:"5px 9px", fontSize:12, fontWeight:700, cursor:"pointer" }}>+{v}s</button>)}
+        </div>
+      </div>
+      <div style={row}>
+        <div><div style={{ fontSize:14 }}>Notification when rest ends</div><div style={{ fontSize:11, color: perm === "denied" ? C.warn : C.dim }}>{permNote}</div></div>
+        <Toggle on={!!prefs.notify && perm === "granted"} onChange={enableNotify} disabled={perm === "denied" || perm === "unsupported"} />
+      </div>
+      <div style={row}>
+        <div><div style={{ fontSize:14 }}>Sound</div><div style={{ fontSize:11, color:C.dim }}>three short beeps · needs the ringer on</div></div>
+        <Toggle on={!!prefs.sound} onChange={v => save({ sound: v })} />
+      </div>
+      <div style={{ ...row, borderBottom:"none" }}>
+        <div><div style={{ fontSize:14 }}>Vibrate</div><div style={{ fontSize:11, color:C.dim }}>Android only; iPhone ignores it</div></div>
+        <Toggle on={!!prefs.vibrate} onChange={v => save({ vibrate: v })} />
+      </div>
+      <div style={{ display:"flex", gap:8, alignItems:"center", marginTop:6 }}>
+        <button onClick={test} style={{ ...btn(C.panel2, C.ink), width:"auto", padding:"8px 14px" }}>Test alert</button>
+        <span style={{ fontSize:11, color:C.acc }}>{testMsg}</span>
+      </div>
+      <div style={{ fontSize:10, color:C.dim, marginTop:8, lineHeight:1.4 }}>
+        Alerts fire from the app itself. They land while the app is on screen or for a few seconds after you switch away; if the phone locks mid-rest, the alert fires the moment you reopen the app. Web apps can't schedule a notification for later.
+      </div>
+      {overrides.length > 0 && (
+        <div style={{ marginTop:10 }}>
+          <div style={{ fontSize:11, color:C.dim, marginBottom:4 }}>Per-exercise overrides</div>
+          {overrides.map(([k, sec]) => (
+            <div key={k} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", fontSize:12, padding:"4px 0" }}>
+              <span>{k.replace(/^lib:|^custom:/, "")}</span>
+              <span style={{ display:"flex", gap:8, alignItems:"center" }}>
+                <span style={{ color:C.acc, fontWeight:700 }}>{fmtRest(sec)}</span>
+                <button onClick={() => save(p => { const byEx = { ...(p.byEx || {}) }; delete byEx[k]; return { byEx }; })} style={{ background:"transparent", border:"none", color:C.dim, cursor:"pointer", fontSize:15, padding:0 }}>×</button>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {picker && <RestPicker title="Default rest" value={prefs.len} fallback={null} onPick={v => { save({ len: v }); setPicker(false); }} onClose={() => setPicker(false)} />}
     </div>
   );
 }
@@ -1151,7 +1340,7 @@ function DragList({ items, keyOf, onMove, render }) {
   );
 }
 
-function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDone, ss, pairing, onPairStart, onPairWith, onUnlink }) {
+function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDone, ss, pairing, onPairStart, onPairWith, onUnlink, restOverride, onRestPick }) {
   const blank = blankSet(entry.t);
   const [collapsed, setCollapsed] = useState(false);
   const [plates, setPlates] = useState(false);
@@ -1275,6 +1464,7 @@ function ExerciseCard({ entry, setEntry, rmEntry, prev, ex, dragHandle, onSetDon
                 ? <button onClick={onPairWith} style={{ ...ssBtn, color:"#04150E", background:C.acc, border:"none" }}>← pair here</button>
                 : <button onClick={onPairStart} style={{ ...ssBtn, color: iAmPairing ? C.gold : C.dim }}>{iAmPairing ? "tap another exercise… (cancel)" : (ss ? "SS +" : "SS")}</button>}
               {ss && !pairing && <button onClick={onUnlink} style={{ ...ssBtn, color:C.dim }}>unlink</button>}
+              {onRestPick && <button onClick={onRestPick} style={{ ...ssBtn, color: restOverride != null ? C.acc : C.dim }}>⏱ {restOverride != null ? fmtRest(restOverride) : "rest"}</button>}
               {ss && !pairing && <span style={{ fontSize:10, color:C.dim }}>superset {ss.letter} · rest after {ss.letter}{ss.size}</span>}
             </div>
           )}
@@ -2311,7 +2501,7 @@ function StatIn({ label, val, onChange, wide }) {
 /* ============================================================
    Program editor — drag reorder of exercises within a day
    ============================================================ */
-function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, removeCustom, updateCustom, exportJson, importJson, onReset, onAdvanceWeek, onExitMeso }) {
+function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, removeCustom, updateCustom, exportJson, importJson, onReset, onAdvanceWeek, onExitMeso, restPrefs, saveRestPrefs }) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmExit, setConfirmExit] = useState(false);
   const st = mesoStatus(program);
@@ -2442,6 +2632,8 @@ function ProgramEditor({ program, setProgram, exByKey, openPicker, custom, remov
       <button onClick={addDay} style={{ ...btn(C.panel2, C.ink), marginTop:12 }}>+ day</button>
 
       <CustomLibrary program={program} custom={custom} removeCustom={removeCustom} updateCustom={updateCustom} />
+
+      {restPrefs && <div style={{ marginTop:20 }}><RestSettings prefs={restPrefs} save={saveRestPrefs} /></div>}
 
       <div style={{ ...card, marginTop:20 }}>
         <div style={{ fontSize:12, color:C.dim, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Backup & reset</div>

@@ -50,6 +50,11 @@
 <script type="text/babel" data-presets="react" src="./app.js"></script>
 
 <script>
+  // Service worker: only so rest-timer notifications work on iOS home-screen
+  // installs (they require registration.showNotification). It caches nothing.
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(function(){});
+  }
   // Diagnostic guard: if React/Babel didn't load, or the app never mounts, say so
   (function () {
     function fail(msg){ var e=document.getElementById('err'); e.style.display='block'; e.textContent='Could not start the app: '+msg+'. If offline, connect and reload.'; }
