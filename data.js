@@ -312,12 +312,12 @@
     let topW = maxW, bumped = false, reason = "";
     if (opts.deload) {
       topW = roundLoad(maxW * 0.9) || maxW;
-      reason = "deload −10%";
+      reason = "Deload week: 10% lighter";
     } else if (topSets.length && topSets.every(s => (s.r || 0) >= repHi)) {
       const inc = incFor(equip, maxW);
       topW = roundLoad(maxW + inc) || (maxW + inc);
       bumped = true;
-      reason = `▲ +${inc}kg — hit ${repHi}s across top sets`;
+      reason = `Up ${inc} kg. You hit ${repHi} reps on every top set`;
     }
     if (opts.fatigueMult && opts.fatigueMult < 1) topW = roundLoad(topW * opts.fatigueMult) || topW;
 
@@ -335,7 +335,7 @@
       }
       plan.push({ w, r });
     }
-    if (!bumped && !opts.deload) reason = `hold ${topW}kg — build reps to ${repHi}`;
+    if (!bumped && !opts.deload) reason = `Stay at ${topW} kg and build to ${repHi} reps`;
     return { topW, plan, bumped, reason };
   }
 
@@ -620,7 +620,7 @@
     const g = GOALS[goal];
     if (!g || g.cardioSessions === 0) return null;
     return { sessions: g.cardioSessions, minutes: g.cardioMin,
-             note: `${g.cardioSessions}×/wk · ${g.cardioMin} min LISS or 10 min HIIT, after lifting or separate day` };
+             note: `${g.cardioSessions} sessions a week: ${g.cardioMin} min steady cardio or 10 min intervals, after lifting or on a rest day` };
   }
 
   /* ==========================================================
@@ -903,7 +903,7 @@
       return {
         week: m.week, total: 4, accumWeeks: 3,
         isDeload: m.week === 4, rir: null, type: "531", tms: m.tms,
-        label: `5/3/1 · ${wave.label} (${m.week}/4)`,
+        label: `${wave.label[0].toUpperCase() + wave.label.slice(1)}, week ${m.week} of 4`,
         splitName: m.splitName, goalLabel: m.goalLabel,
         cardio: null, nutrition: null
       };
@@ -912,8 +912,8 @@
     return {
       week: m.week, total: m.totalWeeks, accumWeeks: m.accumWeeks,
       isDeload, rir: m.rir,
-      label: isDeload ? `Deload week (${m.week}/${m.totalWeeks})`
-                      : `Week ${m.week}/${m.totalWeeks} · accumulation`,
+      label: isDeload ? `Deload, week ${m.week} of ${m.totalWeeks}`
+                      : `Week ${m.week} of ${m.totalWeeks}`,
       splitName: m.splitName, goalLabel: m.goalLabel,
       cardio: m.cardio, nutrition: m.nutrition
     };
