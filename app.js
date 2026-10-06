@@ -5,7 +5,7 @@
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 const { MUSCLES, LIB, T, rpHint, defaultProgram,
         GOALS, SPLITS, splitsForDays, generateProgram, applyWeek, mesoStatus,
-        seedWeight, volumeBand, LANDMARKS, roundLoad, MUSCLE_WEIGHT, EWS,
+        seedWeight, volumeBand, LANDMARKS, roundLoad, MUSCLE_WEIGHT, EWS, cardioScore,
         suggestNext, incFor, generate531 } = window.GymData;
 const { sGet, sSet, sDel, available } = window.GymStore;
 
@@ -214,6 +214,9 @@ const exMapFromLib = () => { const m = new Map(); LIB.forEach(e => m.set(e.key, 
    real sessions: leg-day PR bonus averaged 83 on a base of 37).
    e1RM scale: wr = Epley; rep-only = Epley on bodyweight (reps move the
    1+r/30 term only); holds = 1 + sec/120. All exercises move on the same %.
+   CARDIO (type "cardio") skips all of the above and is scored per minute by
+   GymData.cardioScore: minutes × intensity × pace factor, with progress on
+   duration and pace. See EWS.cardio in data.js.
    ============================================================ */
 function exMetricBest(entry, bw) {
   /* single comparable number for an entry, all on an e1RM-like % scale:
@@ -263,6 +266,18 @@ function scoreSession(session, sessions, exResolve, programDays) {
   session.entries.forEach(e => {
     const ex = exResolve(e.key);
     const muscle = ex ? ex.m : null;
+    /* Cardio: per minute, not per row. Never runs through setQuality, whose
+       rep-target rule used to flag every cardio row in a program day as junk. */
+    if (e.t === "cardio") {
+      const prior = [];
+      byDate.forEach(s => { const pe = s.entries.find(x => x.key === e.key); if (pe && pe.sets && pe.sets.length) prior.push(pe.sets); });
+      const w = muscle === "Mobility/Rehab" && MUSCLE_WEIGHT[muscle] != null ? MUSCLE_WEIGHT[muscle] : 1;
+      const c = cardioScore(ex ? ex.n : e.name, e.sets, prior, w);
+      out.ex.push({ key: e.key, name: e.name, muscle, weight: w, base: c.base, improve: c.improve, pr: c.pr,
+        sets: e.sets.map(() => ({ q: 1, why: "" })), junk: 0, note: c.note });
+      out.base += c.base; out.improve += c.improve; out.pr += c.pr;
+      return;
+    }
     const w = muscle && MUSCLE_WEIGHT[muscle] != null ? MUSCLE_WEIGHT[muscle] : 1;
     const target = day ? (day.items.find(it => it.key === e.key) || {}).target : null;
     const topW = e.t === "wr" ? Math.max(0, ...e.sets.map(x => x.w || 0)) : 0;
@@ -1870,11 +1885,12 @@ function EwsCard({ ews }) {
       {junk > 0 && <div className="small bad" style={{ marginTop: 10 }}>{plural(junk, "junk set")} scored at {Math.round(EWS.junkCredit * 100)}%.</div>}
       {showFormula && (
         <div className="formula">
-          <p><b>Sets</b>: each working set earns {EWS.perSet} points × muscle weight × quality. Lifting muscles all weigh {MUSCLE_WEIGHT.Chest}, cardio {MUSCLE_WEIGHT.Cardio}, mobility {MUSCLE_WEIGHT["Mobility/Rehab"]}.</p>
+          <p><b>Sets</b>: each working set earns {EWS.perSet} points × muscle weight × quality. Lifting muscles all weigh {MUSCLE_WEIGHT.Chest}, mobility {MUSCLE_WEIGHT["Mobility/Rehab"]}.</p>
           <p>Quality: a full set is 1.0, a drop row {EWS.dropCredit}, a light set (50 to 70% of the top load) {EWS.lightCredit}, a junk set (under 50% of the top load, or under half the target) {EWS.junkCredit}. With RPE logged: {EWS.rpe.hard}+ is 1.0, {EWS.rpe.mid} is {EWS.rpe.midCredit}, lower is {EWS.rpe.easyCredit}.</p>
-          <p><b>vs last time</b>: each exercise's points × {EWS.lastK} × h(change in best estimated 1RM since your last session of it), floored at {EWS.lastFloorPct}%.</p>
-          <p><b>PR bonus</b>: each exercise's points × {EWS.prK} × h(% over your previous best), once you have {EWS.prMinPrior} earlier sessions of it.</p>
-          <p>h(p) = ln(1 + p/{EWS.pctScale}). A 3% PR adds about {Math.round(EWS.prK * Math.log(1 + 3 / EWS.pctScale) * 100)}% of that exercise's points, 10% adds {Math.round(EWS.prK * Math.log(1 + 10 / EWS.pctScale) * 100)}%, 25% adds {Math.round(EWS.prK * Math.log(1 + 25 / EWS.pctScale) * 100)}%. Diminishing, never capped.</p>
+          <p><b>Cardio</b>: {EWS.cardio.perMin} point per minute × intensity × pace. Intensity is set by the machine: incline walk 0.8, steady bike 1.0, running 1.2, rower 1.25, assault bike 1.5. Pace compares your km per minute to a normal pace on that machine, from {EWS.cardio.paceMin}× to {EWS.cardio.paceMax}×; with no distance logged it counts as normal. 30 minutes of running at 10 km/h is about {Math.round(30 * EWS.cardio.perMin * 1.2)}.</p>
+          <p><b>vs last time</b>: each exercise's points × {EWS.lastK} × h(change in best estimated 1RM since your last session of it), floored at {EWS.lastFloorPct}%. Cardio splits this between time and pace.</p>
+          <p><b>PR bonus</b>: each exercise's points × {EWS.prK} × h(% over your previous best), once you have {EWS.prMinPrior} earlier sessions of it. Cardio PRs are longest session and fastest pace, half each.</p>
+          <p>h(p) = ln(1 + p/{EWS.pctScale}). A 3% PR adds about {Math.round(EWS.prK * Math.log(1 + 3 / EWS.pctScale) * 100)}% of that exercise's points, 10% adds {Math.round(EWS.prK * Math.log(1 + 10 / EWS.pctScale) * 100)}%, 25% adds {Math.round(EWS.prK * Math.log(1 + 25 / EWS.pctScale) * 100)}%. Diminishing, never capped. Cardio time uses a flatter curve, p/{EWS.cardio.durPctScale}, because sessions swing by 30% or more.</p>
           <p style={{ margin: 0 }}>Estimated 1RM uses Epley on the best set. Bodyweight moves add bodyweight to the load, so 8 to 10 reps is +5%, not +25%. Holds use 1 + seconds/120.</p>
         </div>
       )}

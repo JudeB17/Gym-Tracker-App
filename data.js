@@ -989,6 +989,9 @@
     Quads: 1.0, Glutes: 1.0, Back: 1.0, Hamstrings: 1.0, Chest: 1.0,
     Shoulders: 1.0, Triceps: 1.0, Biceps: 1.0, Calves: 1.0, Core: 1.0,
     Forearms: 1.0, Cardio: 0.5, "Mobility/Rehab": 0.3
+    // Cardio 0.5 now only applies to set-based cardio rows (Sled Push).
+    // Timed cardio is scored per minute via EWS.cardio; the mobility weight
+    // still scales timed warm-ups.
   };
   /* Calibrated Sep 2026 on 32 real sessions. Body parts are even: a quality
      set is a quality set. The earlier size tilt (quads 1.6 … forearms 0.4)
@@ -1011,13 +1014,136 @@
     lastK: 0.25,
     prK: 0.5,
     lastFloorPct: -10,  // regression vs last is capped at -10%
-    prMinPrior: 2       // PR bonus needs at least this many prior sessions of the exercise
+    prMinPrior: 2,      // PR bonus needs at least this many prior sessions of the exercise
+    /* Cardio is scored on minutes, not rows (Oct 2026). Before this a 30 min
+       run was one "set" at half weight, and inside a program day the 3 × 8–12
+       default target flagged it as junk, so it scored ~0.
+         base = minutes × perMin × intensity × paceFactor × mobility weight
+         paceFactor = (pace / refPace)^paceExp, clamped to [paceMin, paceMax];
+                      1.0 when no distance is logged or the machine has no
+                      meaningful distance (stairs, rope)
+       At 1 point per minute a 30 min run at 10 km/h is ~36, about 7 lifting
+       sets. Progress is split evenly between duration and pace (pace only when
+       km and minutes are both logged now and last time). */
+    cardio: { perMin: 1.0, paceExp: 0.7, paceMin: 0.6, paceMax: 1.5,
+              durPctScale: 15 }  // duration swings are big (30 -> 40 min is +33%), so
+                                 // its progress curve is flatter than the lift/pace one
   };
+
+  /* Cardio profiles: [intensity, reference pace in km/min].
+     Intensity is effort per minute relative to a steady stationary bike (1.0).
+     Reference pace is a normal steady pace on that machine, so 12 km on a bike
+     and 5 km on a treadmill both read as "normal" rather than the bike looking
+     2.4× better. null = distance isn't comparable, score on minutes only.
+     Exercises not listed here (your own cardio) default to [1.0, null]. */
+  const CARDIO = {
+    "Incline Walk":              [0.8,  0.09],   // ~5.5 km/h
+    "Elliptical":                [0.9,  0.15],
+    "Stationary Bike":           [1.0,  0.45],   // ~27 km/h on the readout
+    "Treadmill Run":             [1.2,  0.167],  // 10 km/h
+    "Outdoor Run":               [1.2,  0.167],
+    "Stair Climber":             [1.2,  null],
+    "Rowing Machine":            [1.25, 0.2],    // ~2:30 / 500 m
+    "Swimming":                  [1.25, 0.035],  // ~2:50 / 100 m
+    "Jump Rope":                 [1.3,  null],
+    "Ski Erg":                   [1.35, 0.2],
+    "Assault Bike":              [1.5,  0.4],
+    "Stationary Bike (warm-up)": [0.6,  0.4]
+  };
+  function cardioProfile(name) {
+    const c = CARDIO[name];
+    return { intensity: c ? c[0] : 1, refPace: c ? c[1] : null };
+  }
+  /* totals for one cardio entry. A row with distance but no minutes is
+     credited at the reference pace (so it still scores), but doesn't count
+     toward pace. */
+  function cardioTotals(sets, refPace) {
+    let min = 0, km = 0, pMin = 0, pKm = 0;
+    (sets || []).forEach(s => {
+      const m = Number(s && s.min) || 0, d = Number(s && s.dist) || 0;
+      if (m > 0) min += m; else if (d > 0 && refPace) min += d / refPace;
+      km += d;
+      if (m > 0 && d > 0) { pMin += m; pKm += d; }
+    });
+    return { min, km, pace: pMin > 0 ? pKm / pMin : 0 };
+  }
+  /* Score one cardio entry.
+       name     exercise name (for the profile)
+       sets     this session's rows [{min, dist}]
+       prior    earlier sessions' rows for the same exercise, oldest first
+       weight   muscle weight (1 for cardio, the mobility weight for warm-ups)
+     Returns { base, improve, pr, note, min, km, pace }. */
+  function cardioScore(name, sets, prior, weight) {
+    const C = EWS.cardio;
+    const { intensity, refPace } = cardioProfile(name);
+    const now = cardioTotals(sets, refPace);
+    let paceFactor = 1;
+    if (refPace && now.pace > 0) {
+      paceFactor = Math.pow(now.pace / refPace, C.paceExp);
+      paceFactor = Math.max(C.paceMin, Math.min(C.paceMax, paceFactor));
+    }
+    const base = now.min * C.perMin * intensity * paceFactor * (weight == null ? 1 : weight);
+    const out = { base, improve: 0, pr: 0, note: "", min: now.min, km: now.km, pace: now.pace };
+    if (!(now.min > 0)) return out;
+
+    const h = p => Math.sign(p) * Math.log(1 + Math.abs(p) / EWS.pctScale);       // pace
+    const hD = p => Math.sign(p) * Math.log(1 + Math.abs(p) / C.durPctScale);     // duration
+    let last = null, bestMin = 0, bestPace = 0, nPrior = 0;
+    (prior || []).forEach(ps => {
+      const t = cardioTotals(ps, refPace);
+      if (!(t.min > 0)) return;
+      last = t; nPrior++;
+      if (t.min > bestMin) bestMin = t.min;
+      if (t.pace > bestPace) bestPace = t.pace;
+    });
+    const fmtPct = p => (p >= 0 ? "+" : "") + p.toFixed(1) + "%";
+    const notes = [];
+
+    // vs last time: duration always, pace when both sessions have it
+    if (last) {
+      const usePace = now.pace > 0 && last.pace > 0;
+      const wDur = usePace ? 0.5 : 1, wPace = usePace ? 0.5 : 0;
+      const dDur = Math.max(EWS.lastFloorPct, (now.min - last.min) / last.min * 100);
+      let term = wDur * hD(dDur);
+      let msg = fmtPct(dDur) + " time";
+      if (usePace) {
+        const dPace = Math.max(EWS.lastFloorPct, (now.pace - last.pace) / last.pace * 100);
+        term += wPace * h(dPace);
+        msg += ", " + fmtPct(dPace) + " pace";
+      }
+      out.improve = base * EWS.lastK * term;
+      notes.push(msg + " vs last time");
+    }
+
+    // PRs: longest session and fastest pace, each worth half
+    const prParts = [];
+    const prDur = bestMin > 0 && now.min > bestMin;
+    const prPace = bestPace > 0 && now.pace > bestPace;
+    if (nPrior >= EWS.prMinPrior) {
+      const usePace = now.pace > 0 && bestPace > 0;
+      const wDur = usePace ? 0.5 : 1, wPace = usePace ? 0.5 : 0;
+      if (prDur) {
+        const p = (now.min - bestMin) / bestMin * 100;
+        out.pr += base * EWS.prK * wDur * hD(p);
+        prParts.push("longest +" + p.toFixed(1) + "%");
+      }
+      if (prPace && usePace) {
+        const p = (now.pace - bestPace) / bestPace * 100;
+        out.pr += base * EWS.prK * wPace * h(p);
+        prParts.push("fastest pace +" + p.toFixed(1) + "%");
+      }
+      if (prParts.length) notes.push("PR " + prParts.join(", "));
+    } else if (prDur || prPace) {
+      notes.push("new best (PR bonus starts at session " + (EWS.prMinPrior + 1) + ")");
+    }
+    out.note = notes.join(", ");
+    return out;
+  }
 
   window.GymData = {
     MUSCLES, LIB, T, rpHint, defaultProgram,
     // EWS scoring constants
-    MUSCLE_WEIGHT, EWS,
+    MUSCLE_WEIGHT, EWS, CARDIO, cardioProfile, cardioTotals, cardioScore,
     // mesocycle engine
     LANDMARKS, GOALS, SPLITS,
     splitsForDays, generateProgram, applyWeek, mesoStatus,
