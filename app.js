@@ -35,6 +35,29 @@ const e1rm = (w, r) => (!w || !r) ? 0 : w * (1 + r / 30); // Epley
 const workSets = sets => (sets || []).filter(s => !s.drop);
 const isLoadedSet = s => s && s.add != null && Number(s.add) !== 0;
 const fmtAdd = add => add == null || Number(add) === 0 ? "" : (Number(add) > 0 ? "+" : "-") + Math.abs(Number(add)) + "kg";
+/* ---- bodyweight load model ----
+   Plain bodyweight exercises ("rep": Dips, Pull-up, Push-up …) log reps plus
+   an "Assist kg" column: the help from an assist machine or band. 0 or blank
+   = pure bodyweight. Load moved = bodyweight - assist, so less assist reads
+   as stronger. The sign typed doesn't matter (20 and -20 both mean 20 kg of
+   help), which also covers sets logged before Oct 2026.
+   Weighted versions are separate weight×reps exercises with Bodyweight
+   equipment (Weighted Dip, Weighted Pull-up, Weighted Chin-up, or your own):
+   their kg is added to bodyweight, load = bodyweight + kg, so a 5 -> 10 kg
+   belt is a few percent, not +100%. */
+const FALLBACK_BW = 75; // only to keep direction right when no bodyweight has ever been logged
+const BWL = { keys: new Set(LIB.filter(e => e.t === "wr" && e.e === "Bodyweight").map(e => e.key)) };
+const isBwLoaded = key => BWL.keys.has(key);
+/* signed extra load of a bodyweight set: always assistance, so never positive */
+const signedAdd = (key, s) => -Math.abs(Number(s && s.add) || 0);
+/* the load actually moved, in kg, for wr / rep sets */
+const setLoad = (key, t, s, bw) => {
+  if (t === "wr") return isBwLoaded(key) ? (bw || FALLBACK_BW) + (Number(s.w) || 0) : (Number(s.w) || 0);
+  if (t === "rep") return Math.max(0, (bw || FALLBACK_BW) + signedAdd(key, s));
+  return 0;
+};
+const setE1rm = (key, t, s, bw) => e1rm(setLoad(key, t, s, bw), s.r);
+const fmtLoadAdd = (key, add) => (add == null || Number(add) === 0) ? "" : `${Math.abs(Number(add))} kg assist`;
 /* bodyweight for a session: its own, else the nearest session that has one
    (previous preferred). null if nothing is known anywhere. */
 function bwForSession(sessions, idx) {
@@ -44,8 +67,8 @@ function bwForSession(sessions, idx) {
   for (let i = idx + 1; i < sessions.length; i++) if (sessions[i].bodyweight) return sessions[i].bodyweight;
   return null;
 }
-/* e1RM of a loaded bodyweight set; 0 if bodyweight unknown or set unloaded */
-const repE1rm = (s, bw) => (!bw || !isLoadedSet(s)) ? 0 : e1rm(bw + Number(s.add), s.r);
+/* e1RM of a bodyweight set (bodyweight - assist); 0 if bodyweight unknown */
+const repE1rm = (s, bw, key) => !bw ? 0 : setE1rm(key, "rep", s, bw);
 const fmtDur = min => min == null ? "" : min >= 60 ? `${Math.floor(min/60)}h ${String(min%60).padStart(2,"0")}m` : `${min} min`;
 /* human dates: "Mon 6 Oct", plus year when it isn't this year */
 const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -73,8 +96,8 @@ function bestE1rmBefore(sessions, key, excludeId) {
   sessions.forEach(s => {
     if (s.id === excludeId) return;
     const e = s.entries.find(x => x.key === key);
-    if (e && e.t === "wr") e.sets.forEach(x => { const v = e1rm(x.w, x.r); if (v > best) best = v; });
-    if (e && e.t === "rep") { const bw = bwForSession(sessions, sessions.indexOf(s)); e.sets.forEach(x => { const v = repE1rm(x, bw); if (v > best) best = v; }); }
+    if (e && e.t === "wr") { const bw = isBwLoaded(key) ? bwForSession(sessions, sessions.indexOf(s)) : null; e.sets.forEach(x => { const v = setE1rm(key, "wr", x, bw); if (v > best) best = v; }); }
+    if (e && e.t === "rep") { const bw = bwForSession(sessions, sessions.indexOf(s)); e.sets.forEach(x => { const v = repE1rm(x, bw, key); if (v > best) best = v; }); }
   });
   return best;
 }
@@ -228,11 +251,7 @@ function exMetricBest(entry, bw) {
        time          1 + sec/120, so 60→90 s is +17%, not +50%
        wd / cardio   no metric */
   if (!entry.sets.length) return 0;
-  if (entry.t === "wr") return Math.max(0, ...entry.sets.map(x => e1rm(x.w, x.r)));
-  if (entry.t === "rep") {
-    const base = bw || 1;
-    return Math.max(0, ...entry.sets.map(x => e1rm(base + (Number(x.add) || 0), x.r)));
-  }
+  if (entry.t === "wr" || entry.t === "rep") return Math.max(0, ...entry.sets.map(x => setE1rm(entry.key, entry.t, x, bw)));
   if (entry.t === "time") return Math.max(0, ...entry.sets.map(x => x.sec ? 1 + x.sec / 120 : 0));
   return 0;
 }
@@ -244,14 +263,15 @@ function setQuality(set, entry, topW, target) {
     if (r >= EWS.rpe.mid) return { q: EWS.rpe.midCredit, why: "RPE " + r };
     return { q: EWS.rpe.easyCredit, why: "easy" };
   }
-  const load = entry.t === "wr" ? (set.w || 0) : null;
+  const bwl = isBwLoaded(entry.key);
+  const load = entry.t === "wr" ? (bwl ? setLoad(entry.key, "wr", set, entry._bw) : (set.w || 0)) : null;
   if (load != null && topW > 0) {
     if (load <= topW * 0.5) return { q: EWS.junkCredit, why: "junk" };
     if (load < topW * 0.7) return { q: EWS.lightCredit, why: "light" };
   }
   if (target) {
     if (target.repLo && (set.r || 0) < target.repLo * 0.5 && entry.t !== "time") return { q: EWS.junkCredit, why: "junk" };
-    if (target.w && load != null && load < target.w * 0.5) return { q: EWS.junkCredit, why: "junk" };
+    if (target.w && load != null && !bwl && load < target.w * 0.5) return { q: EWS.junkCredit, why: "junk" };
   }
   return { q: 1, why: "" };
 }
@@ -280,8 +300,9 @@ function scoreSession(session, sessions, exResolve, programDays) {
     }
     const w = muscle && MUSCLE_WEIGHT[muscle] != null ? MUSCLE_WEIGHT[muscle] : 1;
     const target = day ? (day.items.find(it => it.key === e.key) || {}).target : null;
-    const topW = e.t === "wr" ? Math.max(0, ...e.sets.map(x => x.w || 0)) : 0;
-    const sets = e.sets.map(s => setQuality(s, e, topW, target));
+    const topW = e.t === "wr" ? Math.max(0, ...e.sets.map(x => setLoad(e.key, "wr", x, bw))) : 0;
+    const eq = { ...e, _bw: bw };
+    const sets = e.sets.map(s => setQuality(s, eq, topW, target));
     const base = sets.reduce((a, q) => a + EWS.perSet * w * q.q, 0);
     // improvement vs last session with this exercise, and vs all-time best
     let improve = 0, pr = 0, note = "";
@@ -344,9 +365,11 @@ function App() {
 
   const saveProgram = useCallback(async p => { setProgram(p); await sSet("program:current", p); }, []);
   const [restPrefs, setRestPrefs] = useState(REST_DEFAULTS);
+  // custom weight×reps exercises with Bodyweight equipment are weighted bodyweight moves
+  useEffect(() => { custom.forEach(c => { if (c.t === "wr" && c.e === "Bodyweight") BWL.keys.add(c.key); else BWL.keys.delete(c.key); }); }, [custom]);
   const saveRestPrefs = useCallback(patch => setRestPrefs(prev => { const next = { ...prev, ...(typeof patch === "function" ? patch(prev) : patch) }; sSet("prefs:rest", next); return next; }), []);
   /* EWS for any session against the current session list + program targets */
-  const scoreOf = useCallback(s => scoreSession(s, sessions, exByKey, program ? program.days : null), [sessions, exByKey, program]);
+  const scoreOf = useCallback(s => scoreSession(s, sessions, exByKey, program ? program.days : null), [sessions, exByKey, program, custom]);
 
   /* ---- draft persistence: survive PWA kill / accidental close ---- */
   const draftReady = useRef(false);
@@ -525,18 +548,33 @@ function App() {
       }
       if (exType === "rep") {
         const pw = workSets(prev).length ? workSets(prev) : prev;
-        // anchor on the heaviest loading; among equal loads, the most reps
+        const assisted = true; // the kg column on bodyweight exercises is always assistance
+        /* anchor on the hardest loading (least assist);
+           among equal loads, the most reps */
         const ref = pw.reduce((a, s) => {
-          const la = Number(a.add) || 0, ls = Number(s.add) || 0;
+          const la = signedAdd(key, a), ls = signedAdd(key, s);
           if (ls > la) return s;
           if (ls === la && (s.r || 0) >= (a.r || 0)) return s;
           return a;
         }, pw[0]);
         const cap = (t && t.repHi) || null;
+        const refA = Math.abs(Number(ref.add) || 0);
+        if (assisted && cap && refA > 0 && (ref.r || 0) >= cap) {
+          // topped out the reps at this assist: take some help away
+          const step = refA >= 20 ? 5 : 2.5;
+          const nextA = Math.max(0, refA - step);
+          ghostR = String((t && t.repLo) || Math.max(1, cap - 4));
+          return { target: t, ghostW, ghostR, ghostAdd: nextA ? String(nextA) : "", est: false, plan: null,
+                   progNote: `Last time ${ref.r} reps at ${refA} kg assist. Drop to ${nextA ? nextA + " kg assist" : "no assist"}`, progKind: "up" };
+        }
         const next = (ref.r || 0) + 1;
         ghostR = String(cap ? Math.min(next, cap) : next);
-        const ghostAdd = ref.add != null && Number(ref.add) !== 0 ? String(ref.add) : "";
-        const addStr = fmtAdd(ref.add);
+        if (cap && refA === 0 && (ref.r || 0) >= cap) {
+          return { target: t, ghostW, ghostR, ghostAdd: "", est: false, plan: null,
+                   progNote: `Last time ${ref.r} reps unassisted, the top of the range. Move to the weighted version or a harder variation`, progKind: "up" };
+        }
+        const ghostAdd = ref.add != null && Number(ref.add) !== 0 ? String(assisted ? refA : ref.add) : "";
+        const addStr = fmtLoadAdd(key, ref.add);
         return { target: t, ghostW, ghostR, ghostAdd, est: false, plan: null,
                  progNote: ref.r ? `Last time ${ref.r} reps${addStr ? " at " + addStr : ""}. Aim for ${ghostR}` : "" };
       }
@@ -649,10 +687,12 @@ function App() {
     delete clean.startedAt;
     // PR scan: any wr exercise whose best e1RM beats all prior history
     let prCount = 0;
+    const next0 = [...sessions.filter(s => s.id !== clean.id), clean];
     clean.entries.forEach(e => {
       let best = 0;
-      if (e.t === "wr") best = Math.max(0, ...e.sets.map(s => e1rm(s.w, s.r)));
-      else if (e.t === "rep" && clean.bodyweight) best = Math.max(0, ...e.sets.map(s => repE1rm(s, clean.bodyweight)));
+      const sbw = clean.bodyweight || bwForSession(next0, next0.length - 1);
+      if (e.t === "wr") best = Math.max(0, ...e.sets.map(s => setE1rm(e.key, "wr", s, isBwLoaded(e.key) ? sbw : null)));
+      else if (e.t === "rep" && sbw) best = Math.max(0, ...e.sets.map(s => repE1rm(s, sbw, e.key)));
       else return;
       if (!best) return;
       const prior = bestE1rmBefore(sessions, e.key, clean.id);
@@ -1443,12 +1483,13 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
     }) }));
   };
 
-  const cols = { wr: ["kg", "Reps", "RPE"], rep: ["Reps", "+kg", "RPE"], time: ["Seconds"], wd: ["kg", "Metres"], cardio: ["Minutes", "km"] }[entry.t];
+  const bwl = isBwLoaded(entry.key);
+  const cols = { wr: [bwl ? "+kg" : "kg", "Reps", "RPE"], rep: ["Reps", "Assist kg", "RPE"], time: ["Seconds"], wd: ["kg", "Metres"], cardio: ["Minutes", "km"] }[entry.t];
   const keys = { wr: ["w", "r", "rpe"], rep: ["r", "add", "rpe"], time: ["sec"], wd: ["w", "dist"], cardio: ["min", "dist"] }[entry.t];
   const grid = { gridTemplateColumns: `44px ${keys.map(k => k === "rpe" ? "0.8fr" : "1fr").join(" ")} 44px` };
   const hint = targetHint(entry.t, entry.target);
   const rp = !hint ? rpHint(ex) : null;
-  const prevStr = prev ? prevSummary(entry.t, prev) : null;
+  const prevStr = prev ? prevSummary(entry.t, prev, entry.key) : null;
   const nDone = entry.sets.filter(s => s.done).length;
   const ph = (k, i) => {
     const row = i != null ? entry.sets[i] : null;
@@ -1566,7 +1607,7 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
           canSS && { label: ss ? `Add another exercise to superset ${ss.letter}` : "Superset with another exercise", onClick: onPairStart, disabled: count < 2 },
           ss && { label: `Remove from superset ${ss.letter}`, onClick: onUnlink },
           onRestPick && { label: `Rest after this exercise (${restLabel})`, onClick: onRestPick },
-          (entry.t === "wr" || entry.t === "wd") && { label: "Plate calculator", onClick: () => setPlates(true) },
+          (entry.t === "wr" || entry.t === "wd") && !bwl && { label: "Plate calculator", onClick: () => setPlates(true) },
           { label: "Remove exercise", danger: true, onClick: () => rmEntry(entry.eid) }
         ]} />
       )}
@@ -1643,10 +1684,10 @@ function targetHint(t, target) {
   if (t === "time") return plural(target.sets, "hold");
   return plural(target.sets, "set");
 }
-function prevSummary(t, sets) {
+function prevSummary(t, sets, key) {
   const dp = s => s.drop ? "drop " : "";
   if (t === "wr") return sets.map(s => `${dp(s)}${s.w}×${s.r}`).join(", ");
-  if (t === "rep") return sets.map(s => `${dp(s)}${s.r}${isLoadedSet(s) ? " " + fmtAdd(s.add) : ""}`).join(", ");
+  if (t === "rep") return sets.map(s => `${dp(s)}${s.r}${isLoadedSet(s) ? " " + fmtLoadAdd(key, s.add) : ""}`).join(", ");
   if (t === "time") return sets.map(s => `${s.sec} s`).join(", ");
   if (t === "wd") return sets.map(s => `${s.w} kg ${s.dist} m`).join(", ");
   return sets.map(s => `${s.min || 0} min${s.dist ? ` ${s.dist} km` : ""}`).join(", ");
@@ -1800,9 +1841,10 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf }) 
           tag = String.fromCharCode(65 + gl[e.group]) + seen[e.group];
         }
         const nDrops = e.sets.filter(x => x.drop).length;
-        const repBest = e.t === "rep" && session.bodyweight ? Math.max(0, ...e.sets.map(x => repE1rm(x, session.bodyweight))) : 0;
+        const repBest = e.t === "rep" && session.bodyweight ? Math.max(0, ...e.sets.map(x => repE1rm(x, session.bodyweight, e.key))) : 0;
+        const bwlWr = e.t === "wr" && isBwLoaded(e.key);
         const es = exScore(e.key);
-        const wrBest = e.sets.length > 0 && e.t === "wr" ? Math.round(Math.max(...e.sets.map(x => e1rm(x.w, x.r)))) : 0;
+        const wrBest = e.sets.length > 0 && e.t === "wr" && (!bwlWr || session.bodyweight) ? Math.round(Math.max(...e.sets.map(x => setE1rm(e.key, "wr", x, session.bodyweight)))) : 0;
         let n = 0;
         return (
           <div key={idx} className={cx("chart", tag && "ex ss")} style={{ marginTop: 12 }}>
@@ -1819,7 +1861,7 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf }) 
                   return (
                     <tr key={i}>
                       <td className="n" style={s.drop ? { color: C.warn, fontSize: 12, fontWeight: 600 } : null}>{s.drop ? "Drop" : n}</td>
-                      <td>{setLine(e.t, s)}</td>
+                      <td>{setLine(e.t, s, e.key)}</td>
                       <td className={cx("q", why === "junk" && "bad")}>{why ? QUALITY_WORD[why] || why : ""}</td>
                     </tr>
                   );
@@ -1828,7 +1870,7 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf }) 
             </table>
             {(wrBest > 0 || repBest > 0 || nDrops > 0) && (
               <div className="muted small" style={{ marginTop: 6 }}>
-                {wrBest > 0 && <>Best estimated 1RM {wrBest} kg</>}
+                {wrBest > 0 && <>Best estimated 1RM {wrBest} kg{bwlWr ? " including bodyweight" : ""}</>}
                 {repBest > 0 && <>Best estimated 1RM {Math.round(repBest)} kg including bodyweight</>}
                 {nDrops > 0 && <>{(wrBest > 0 || repBest > 0) ? ". " : ""}{plural(workSets(e.sets).length, "working set")} plus {plural(nDrops, "drop")}</>}
               </div>
@@ -1891,16 +1933,16 @@ function EwsCard({ ews }) {
           <p><b>vs last time</b>: each exercise's points × {EWS.lastK} × h(change in best estimated 1RM since your last session of it), floored at {EWS.lastFloorPct}%. Cardio splits this between time and pace.</p>
           <p><b>PR bonus</b>: each exercise's points × {EWS.prK} × h(% over your previous best), once you have {EWS.prMinPrior} earlier sessions of it. Cardio PRs are longest session and fastest pace, half each.</p>
           <p>h(p) = ln(1 + p/{EWS.pctScale}). A 3% PR adds about {Math.round(EWS.prK * Math.log(1 + 3 / EWS.pctScale) * 100)}% of that exercise's points, 10% adds {Math.round(EWS.prK * Math.log(1 + 10 / EWS.pctScale) * 100)}%, 25% adds {Math.round(EWS.prK * Math.log(1 + 25 / EWS.pctScale) * 100)}%. Diminishing, never capped. Cardio time uses a flatter curve, p/{EWS.cardio.durPctScale}, because sessions swing by 30% or more.</p>
-          <p style={{ margin: 0 }}>Estimated 1RM uses Epley on the best set. Bodyweight moves add bodyweight to the load, so 8 to 10 reps is +5%, not +25%. Holds use 1 + seconds/120.</p>
+          <p style={{ margin: 0 }}>Estimated 1RM uses Epley on the best set. Bodyweight moves add bodyweight to the load, so 8 to 10 reps is +5%, not +25%. On bodyweight exercises the Assist kg is subtracted from bodyweight, so less assistance scores as stronger; weighted versions add the kg to bodyweight. Holds use 1 + seconds/120.</p>
         </div>
       )}
     </div>
   );
 }
-function setLine(t, s) {
+function setLine(t, s, key) {
   const rpe = s.rpe != null && s.rpe !== "" ? `, RPE ${s.rpe}` : "";
-  if (t === "wr") return `${s.w} kg × ${s.r}${rpe}`;
-  if (t === "rep") return `${plural(s.r, "rep")}${isLoadedSet(s) ? ` ${fmtAdd(s.add)}` : ""}${rpe}`;
+  if (t === "wr") return `${isBwLoaded(key) ? "+" : ""}${s.w} kg × ${s.r}${rpe}`;
+  if (t === "rep") return `${plural(s.r, "rep")}${isLoadedSet(s) ? ` ${fmtLoadAdd(key, s.add)}` : ""}${rpe}`;
   if (t === "time") return `${s.sec} s`;
   if (t === "wd") return `${s.w} kg, ${s.dist} m`;
   return `${s.min || 0} min${s.dist ? `, ${s.dist} km` : ""}`;
@@ -1936,10 +1978,14 @@ function exerciseHistory(sessions, picked, ex) {
     const e = s.entries.find(x => x.key === picked);
     if (!e || !e.sets.length) return null;
     let metric = 0, label = "";
-    if (ex.t === "wr") { metric = Math.round(Math.max(...e.sets.map(x => e1rm(x.w, x.r)))); label = metric + " kg"; }
+    if (ex.t === "wr") {
+      // weighted bodyweight moves: e1RM of (bodyweight + belt)
+      const bw = isBwLoaded(picked) ? bwForSession(sessions, si) : null;
+      metric = Math.round(Math.max(...e.sets.map(x => setE1rm(picked, "wr", x, bw)))); label = metric + " kg";
+    }
     else if (ex.t === "rep" && loadedMode) {
       const bw = bwForSession(sessions, si);
-      metric = Math.round(Math.max(...e.sets.map(x => bw ? e1rm(bw + (Number(x.add) || 0), x.r) : 0)));
+      metric = Math.round(Math.max(...e.sets.map(x => bw ? repE1rm(x, bw, picked) || e1rm(bw, x.r) : 0)));
       label = metric + " kg";
     }
     else if (ex.t === "rep") { metric = Math.max(...e.sets.map(x => x.r || 0)); label = plural(metric, "rep"); }
@@ -1964,7 +2010,7 @@ function ExerciseDetail({ sessions, exMap, exKey, onBack }) {
   }, [history]);
   const series = withPr.filter(h => h.metric > 0).map(h => ({ date: h.date, v: h.metric, pr: h.pr }));
   const loadedMode = history.length > 0 && history[0].loadedMode;
-  const metricName = ex ? (loadedMode || ex.t === "wr" ? "Estimated 1RM" : { rep: "Most reps", time: "Longest hold", wd: "Heaviest load", cardio: "Distance" }[ex.t]) : "";
+  const metricName = ex ? (ex.t === "wr" && isBwLoaded(exKey) ? "Estimated 1RM including bodyweight" : loadedMode || ex.t === "wr" ? "Estimated 1RM" : { rep: "Most reps", time: "Longest hold", wd: "Heaviest load", cardio: "Distance" }[ex.t]) : "";
   const unit = ex ? (loadedMode || ex.t === "wr" || ex.t === "wd" ? "kg" : { rep: "reps", time: "s", cardio: "km" }[ex.t]) : "";
   const first = series[0]?.v, last = series[series.length - 1]?.v;
   const delta = (first && last) ? Math.round((last - first) / first * 1000) / 10 : null;
@@ -1991,7 +2037,7 @@ function ExerciseDetail({ sessions, exMap, exKey, onBack }) {
             <div key={i} className="row" style={{ alignItems: "flex-start" }}>
               <div className="row-main">
                 <div className="row-title">{fmtDay(h.date)} {h.pr && <span className="tag pr">PR</span>}</div>
-                <div className="row-sub num-t">{prevSummary(h.t, h.sets)}</div>
+                <div className="row-sub num-t">{prevSummary(h.t, h.sets, exKey)}</div>
                 {h.note && <div className="row-sub dim" style={{ marginTop: 4 }}>{h.note}</div>}
               </div>
               <div className="row-value" style={{ fontWeight: 600, color: C.ink }}>{h.label}</div>
@@ -2145,7 +2191,7 @@ function MuscleDetail({ sessions, muscle, exResolve, onBack, onPickExercise }) {
               <button key={j} className="row" onClick={() => onPickExercise && onPickExercise(e.key)}>
                 <div className="row-main">
                   <div className="row-title" style={{ fontSize: 15 }}>{e.name}</div>
-                  <div className="row-sub num-t">{prevSummary(e.t, e.sets)}</div>
+                  <div className="row-sub num-t">{prevSummary(e.t, e.sets, e.key)}</div>
                 </div>
                 <span className="row-chev"><Icon n="chevR" s={18} /></span>
               </button>
