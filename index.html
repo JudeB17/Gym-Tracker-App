@@ -98,6 +98,8 @@
   .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:50px;padding:0 18px;border-radius:var(--r);font-size:17px;font-weight:600;
        transition:background .12s,transform .12s,opacity .12s;user-select:none;-webkit-user-select:none;}
   .btn:active:not(:disabled){transform:scale(.985);}
+  a.btn,a.row{text-decoration:none;}
+  a.row{color:inherit;}
   .btn.block{width:100%;}
   .btn-primary{background:var(--accent);color:var(--accent-ink);}
   .btn-primary:active:not(:disabled){background:var(--accent-press);}
@@ -301,6 +303,7 @@
 <!-- app data + storage (plain JS, run immediately) -->
 <script src="./data.js"></script>
 <script src="./storage.js"></script>
+<script src="./howto.js"></script>
 
 <!-- main app (JSX, compiled by Babel via type="text/babel") -->
 <script type="text/babel" data-presets="react" src="./app.js"></script>

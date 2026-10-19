@@ -4,10 +4,12 @@
    ============================================================ */
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 const { MUSCLES, LIB, T, rpHint, defaultProgram,
-        GOALS, SPLITS, splitsForDays, generateProgram, applyWeek, mesoStatus,
-        seedWeight, volumeBand, LANDMARKS, roundLoad, MUSCLE_WEIGHT, EWS, cardioScore,
-        suggestNext, incFor, generate531 } = window.GymData;
+        GOALS, SPLITS, splitsForDays, generateProgram, applyWeek, mesoStatus, weekVolume, adjustVolume,
+        seedWeight, convertLoad, volumeBand, LANDMARKS, roundLoad, MUSCLE_WEIGHT, EWS, cardioScore,
+        suggestNext, suggestRIR, incFor, generate531 } = window.GymData;
 const { sGet, sSet, sDel, available } = window.GymStore;
+const HOWTO = window.GymHowTo || { DATA: {}, PATTERN: {}, IMG: [] };
+const howMeta = ex => (ex && HOWTO.DATA[ex.n]) || {};
 
 /* ---------- theme (mirrors the CSS custom properties in index.html; used
    where a colour has to be passed into SVG or computed inline) ---------- */
@@ -18,6 +20,9 @@ const C = {
 };
 const T_LABEL = { wr: "Weight and reps", rep: "Bodyweight reps", time: "Timed hold", wd: "Load and distance", cardio: "Cardio" };
 const cx = (...a) => a.filter(Boolean).join(" ");
+/* pseudo day id for an unprogrammed session: no plan, no targets, exercises
+   added as you go. Saved sessions carry dayId null. */
+const FREE_DAY = "__free";
 
 /* ---------- helpers ---------- */
 const uid = () => Math.random().toString(36).slice(2, 9);
@@ -90,6 +95,85 @@ const daysAgo = dateStr => {
   const d = new Date(dateStr + "T00:00:00"), t = new Date(TODAY() + "T00:00:00");
   return Math.round((t - d) / 86400000);
 };
+const addDays = (dateStr, n) => { const d = new Date(dateStr + "T00:00:00"); d.setDate(d.getDate() + n); return fmtDate(d); };
+
+/* ---- mesocycle calendar ----
+   A meso week lasts 7 days from meso.weekStartedOn. When it's up, the next
+   week starts by itself (sets, RIR and the deload follow via applyWeek).
+   lastAuto records the move so the Log screen can offer to go back if the
+   week's workouts weren't all done. */
+/* program days logged in a meso week (sessions saved before Oct 2026 carry no
+   mesoWeek; for the current week they count by date) */
+function mesoWeekDone(program, sessions, week) {
+  const m = program && program.meso; const out = new Set();
+  if (!m) return out;
+  const ids = new Set(program.days.map(d => d.id));
+  sessions.forEach(s => {
+    if (!s.dayId || !ids.has(s.dayId)) return;
+    const inWeek = s.mesoWeek != null ? s.mesoWeek === week
+      : (week === m.week && !!m.weekStartedOn && s.date >= m.weekStartedOn);
+    if (inWeek) out.add(s.dayId);
+  });
+  return out;
+}
+/* Advanced mode: check-in answers from sessions logged in a meso week,
+   grouped by muscle: { Chest: [{soreness, pump, workload, joint}, ...] } */
+function feedbackForWeek(sessions, week) {
+  const by = {};
+  sessions.forEach(s => {
+    if (s.mesoWeek !== week || !s.feedback) return;
+    const post = s.feedback.post || {}, sore = s.feedback.soreness || {};
+    new Set([...Object.keys(post), ...Object.keys(sore)]).forEach(mu => {
+      (by[mu] = by[mu] || []).push({ ...(post[mu] || {}), soreness: sore[mu] || null });
+    });
+  });
+  return by;
+}
+const isAdvanced = program => !!(program && program.feedbackMode === "advanced" && program.meso && program.meso.type !== "531");
+/* move a meso from its current week to `target`. In Advanced mode each step
+   sets next week's sets per muscle from the finished week's check-ins, keeps
+   each week's volume in volHist (so going back restores it) and brings the
+   deload forward when two or more muscles hit their ceiling. */
+function stepTo(program, sessions, target) {
+  const m = program.meso;
+  const adv = isAdvanced(program);
+  let vol = adv ? (m.vol || weekVolume(m, m.week)) : null;
+  const volHist = { ...(m.volHist || {}) };
+  let week = m.week, notes = [], ceilings = [], early = false;
+  while (week < target) {
+    if (adv) volHist[week] = vol;
+    const next = week + 1;
+    if (adv && next <= m.accumWeeks) {
+      const a = adjustVolume(m, vol, week, next, feedbackForWeek(sessions, week));
+      vol = a.vol; notes = a.notes; ceilings = a.ceilings;
+      if (a.ceilings.length >= 2 && week >= 2) { early = true; week = m.accumWeeks + 1; break; }
+    }
+    week = next;
+  }
+  const base = adv ? { ...program, meso: { ...m, vol, volHist } } : program;
+  return { program: applyWeek(base, week), week, notes, ceilings, early };
+}
+/* returns the advanced program, or null when nothing changes */
+function autoAdvance(program, sessions) {
+  const m = program && program.meso;
+  if (!m) return null;
+  const today = TODAY();
+  // existing mesos (before Oct 2026) had no calendar: the current week starts today
+  if (!m.weekStartedOn) return { ...program, meso: { ...m, weekStartedOn: today } };
+  let week = m.week, start = m.weekStartedOn;
+  while (week < m.totalWeeks && addDays(start, 7) <= today) { week++; start = addDays(start, 7); }
+  if (week === m.week) return null;
+  const r = stepTo(program, sessions || [], week);
+  return { ...r.program, meso: { ...r.program.meso, weekStartedOn: start,
+    lastAuto: { from: m.week, to: r.week, on: today, notes: r.notes, ceilings: r.ceilings, early: r.early } } };
+}
+/* "Chest +2, Back held (still sore)" */
+function fmtVolNotes(notes) {
+  return (notes || []).map(n => {
+    const d = n.to - n.from;
+    return `${n.muscle} ${d > 0 ? "+" + d : d < 0 ? String(d) : "held"}${d <= 0 && n.why ? ` (${n.why})` : ""}`;
+  }).join(", ");
+}
 // best e1RM for an exercise key across sessions, optionally excluding one session id
 function bestE1rmBefore(sessions, key, excludeId) {
   let best = 0;
@@ -340,6 +424,50 @@ const fmtEws = v => String(Math.round(v));
 
 
 /* ============================================================
+   Similar exercises (swap)
+   Ranked on: same movement pattern (+10), same main muscle (+5, or +2 when
+   it is the other one's secondary), shared secondary muscles (up to +2),
+   same equipment (+1.5), same stretch bias (+1), same log type (+1).
+   Kept: anything with the same pattern, plus same-muscle exercises that
+   score at least 6.5. Your own exercises have no pattern, so they match on
+   muscle only.
+   ============================================================ */
+function similarExercises(from, all) {
+  if (!from) return [];
+  const fm = howMeta(from), fsec = fm.s || [];
+  const loose = fm.p === "cardio" || fm.p === "rehab";
+  return all.filter(e => e.key !== from.key && e.n !== from.n).map(e => {
+    const m = howMeta(e), sec = m.s || [];
+    const samePat = !!(fm.p && m.p && fm.p === m.p);
+    let sc = samePat ? 10 : 0;
+    if (e.m === from.m) sc += 5; else if (sec.includes(from.m) || fsec.includes(e.m)) sc += 2;
+    sc += Math.min(2, sec.filter(x => fsec.includes(x)).length);
+    if (e.e === from.e) sc += 1.5;
+    if (!!m.st === !!fm.st) sc += 1;
+    if (e.t === from.t) sc += 1;
+    return { ex: e, sc, samePat, pat: m.p };
+  }).filter(x => x.samePat || (!loose && x.ex.m === from.m && x.sc >= 6.5))
+    .sort((a, b) => b.sc - a.sc || a.ex.n.localeCompare(b.ex.n));
+}
+/* rep band for the new exercise in a slot: keep the slot's band when the two
+   play the same role (compound for compound), else the new exercise's own */
+function swapTarget(oldTarget, oldEx, newEx) {
+  if (!oldTarget) return null;
+  const keep = oldEx && newEx && oldEx.role === newEx.role;
+  const [lo, hi] = keep ? [oldTarget.repLo, oldTarget.repHi] : (newEx.rp || [8, 12]);
+  const { plan, ...rest } = oldTarget;
+  return { ...rest, repLo: lo, repHi: hi, w: null };
+}
+const roleTier = role => role === "heavy" ? "pri" : role === "compound" ? "sec" : "iso";
+const topWeight = sets => sets && sets.length ? Math.max(0, ...workSets(sets).map(s => Number(s.w) || 0)) : 0;
+/* video links: YouTube id from a watch / youtu.be / shorts / embed link */
+function youTubeId(url) {
+  const m = String(url || "").match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+const ytSearch = name => `https://www.youtube.com/results?search_query=${encodeURIComponent(name + " exercise how to proper form")}`;
+
+/* ============================================================
    App
    ============================================================ */
 function App() {
@@ -356,6 +484,9 @@ function App() {
   const [toast, setToast] = useState("");
   const [picker, setPicker] = useState(null);
   const [gyms, setGyms] = useState([]);          // known gym names
+  const [videos, setVideos] = useState({});      // your own video link per exercise key
+  const [howTo, setHowTo] = useState(null);      // exercise key whose how-to sheet is open
+  const [swap, setSwap] = useState(null);        // { fromKey, onPick(key, scope), scopes }
   const lastGym = useRef(null);                   // most recently used gym
 
   const toastTimer = useRef(null);
@@ -397,10 +528,11 @@ function App() {
         if (!p || !p.days || !Array.isArray(p.days)) { p = defaultProgram(); await sSet("program:current", p); }
         else { const mig = migrate(p); if (mig !== p) { p = mig; await sSet("program:current", p); } }
         setProgram(p);
-        setActiveDayId(p.days[0]?.id ?? null);
+        setActiveDayId(p.days[0]?.id ?? FREE_DAY);
         setCustom((await sGet("library:custom")) || []);
         setInjuries((await sGet("injuries:list")) || []);
         setGyms((await sGet("gyms:list")) || []);
+        setVideos((await sGet("library:videos")) || {});
         lastGym.current = (await sGet("gyms:last")) || null;
         {
           const rp = await sGet("prefs:rest");
@@ -441,27 +573,28 @@ function App() {
      lastForExercise stays as-is for display. */
   const refSetsForExercise = useCallback(key => {
     const recent = []; // newest first, up to 4
+    const rirOf = [];  // the RIR target each of those sessions was prescribed (null if unknown)
     for (let i = sessions.length - 1; i >= 0 && recent.length < 4; i--) {
       const e = sessions[i].entries.find(x => x.key === key);
-      if (e && e.sets.length) recent.push(e.sets);
+      if (e && e.sets.length) { recent.push(e.sets); rirOf.push(sessions[i].rirTarget != null ? sessions[i].rirTarget : null); }
     }
     if (!recent.length) return null;
     const topW = sets => Math.max(0, ...sets.map(s => s.w || 0));
-    if (recent.length === 1) return { sets: recent[0], offDay: false };
+    if (recent.length === 1) return { sets: recent[0], offDay: false, rir: rirOf[0] };
     const w = recent.map(topW);
     const refW = Math.max(...w);
-    if (!(refW > 0)) return { sets: recent[0], offDay: false };
+    if (!(refW > 0)) return { sets: recent[0], offDay: false, rir: rirOf[0] };
     const TOL = 0.95;
     // last session at (or near) the recent best -> normal
-    if (w[0] >= refW * TOL) return { sets: recent[0], offDay: false };
+    if (w[0] >= refW * TOL) return { sets: recent[0], offDay: false, rir: rirOf[0] };
     // count consecutive misses ending at the most recent session
     let misses = 0;
     while (misses < w.length && w[misses] < refW * TOL) misses++;
     // three or more in a row -> consistent, accept the reset
-    if (misses >= 3) return { sets: recent[0], offDay: false };
+    if (misses >= 3) return { sets: recent[0], offDay: false, rir: rirOf[0] };
     // one or two off days -> anchor to the best recent session instead
     const bestIdx = w.indexOf(refW);
-    return { sets: recent[bestIdx], offDay: true, refW };
+    return { sets: recent[bestIdx], offDay: true, refW, rir: rirOf[bestIdx] };
   }, [sessions]);
 
   /* ---- prefill model ----
@@ -481,6 +614,14 @@ function App() {
   }, [program]);
 
   const mesoStats = useMemo(() => (program && program.meso && program.meso.stats) || {}, [program]);
+
+  /* this week's RIR target on a hypertrophy mesocycle (null otherwise: plain
+     programs and 5/3/1 keep double progression, which needs no RIR) */
+  const mesoRir = useMemo(() => {
+    const m = program && program.meso;
+    if (!m || m.type === "531" || !m.rir) return null;
+    return m.rir.lo;
+  }, [program]);
 
   // most recent logged bodyweight, for bodyweight-fraction seeds
   const lastBodyweight = useMemo(() => {
@@ -524,9 +665,13 @@ function App() {
            session's set 1 and the rest work down from there. Stable sort, so a
            normal top-set-first session is unchanged. */
         const ordered = refWork.slice().sort((a, b) => ((b.w || 0) - (a.w || 0)) || ((b.r || 0) - (a.r || 0)));
-        const sug = suggestNext(ordered, ex, band, {
-          deload: mesoDeload, nSets: nSets || ordered.length, workDown
-        });
+        /* hypertrophy meso: load and reps solved from logged RPE and this
+           week's RIR target. Weighted bodyweight moves (load includes
+           bodyweight) stay on double progression. */
+        const useRir = mesoRir != null && !isBwLoaded(key);
+        const sug = useRir
+          ? suggestRIR(ordered, ex, band, { rirTarget: mesoRir, rirFallback: ref.rir, deload: mesoDeload, nSets: nSets || ordered.length, workDown })
+          : suggestNext(ordered, ex, band, { deload: mesoDeload, nSets: nSets || ordered.length, workDown });
         if (sug) {
           /* No later set at the top weight asks for more reps than set 1.
              (Back-off sets at a lighter weight are left alone.) */
@@ -538,7 +683,7 @@ function App() {
           if (t) t.w = sug.topW;
           const note = ref.offDay ? `Last session looked like an off day. Back to ${sug.topW} kg` : sug.reason;
           return { target: t, ghostW: plan[0].w, ghostR: plan[0].r, est: false, plan, progNote: note,
-                   progKind: mesoDeload ? "deload" : sug.bumped ? "up" : "" };
+                   progKind: mesoDeload ? "deload" : sug.bumped || sug.kind === "reps" ? "up" : (sug.kind === "down" || sug.kind === "fewer") ? "deload" : "" };
         }
       }
       if (exType === "wd") {
@@ -611,34 +756,13 @@ function App() {
     // fall through: reps ghost from target if present
     if (t && t.repLo != null) ghostR = String(t.repLo);
     return { target: t, ghostW, ghostR, est, plan: null, progNote: "" };
-  }, [lastForExercise, refSetsForExercise, mesoDeload, mesoStats, lastBodyweight, exByKey, workDown]);
+  }, [lastForExercise, refSetsForExercise, mesoDeload, mesoRir, mesoStats, lastBodyweight, exByKey, workDown]);
 
   /* ---- session lifecycle ---- */
-  const startSession = useCallback(() => {
-    const day = program.days.find(d => d.id === activeDayId);
-    if (!day) return;
-    let wrIndex = 0;
-    setDraft({
-      id: uid(), date: TODAY(), dayId: day.id, dayName: day.name, bodyweight: "", feel: null, startedAt: Date.now(),
-      gym: lastGym.current || null,
-      injuries: injuries.filter(i => !i.closed).map(i => ({ name: i.name, pain: 0, swelling: false, note: "" })),
-      entries: day.items.map(it => {
-        const ex = exByKey(it.key); if (!ex) return null;
-        const pf = prefillFor(it.key, it.target, ex.t, ex.n, { wrIndex });
-        if (ex.t === "wr") wrIndex++;
-        const nSets = it.target?.sets || 1;
-        return { eid: uid(), key: it.key, name: ex.n, t: ex.t, note: "", group: null,
-          est: pf.est, target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR, ghostAdd: pf.ghostAdd || "",
-          plan: pf.plan || null, progNote: pf.progNote || "", progKind: pf.progKind || "",
-          sets: Array.from({ length: nSets }, () => blankSet(ex.t)) };
-      }).filter(Boolean)
-    });
-    setViewSession(null); setTab("log");
-  }, [program, activeDayId, exByKey, prefillFor, injuries]);
-
   const addExerciseToDraft = useCallback(exKey => {
     const ex = exByKey(exKey); if (!ex) return;
     setDraft(d => {
+      if (!d) return d;
       const wrIndex = d.entries.filter(e => e.t === "wr").length;
       const pf = prefillFor(exKey, null, ex.t, ex.n, { wrIndex });
       const nSets = pf.plan ? pf.plan.length : 1;
@@ -648,6 +772,54 @@ function App() {
         sets: Array.from({ length: nSets }, () => blankSet(ex.t)) }] };
     });
   }, [exByKey, prefillFor]);
+
+  const startSession = useCallback(() => {
+    const m = program && program.meso;
+    const base = {
+      id: uid(), date: TODAY(), bodyweight: "", feel: null, startedAt: Date.now(),
+      // which meso week this belongs to and what effort it was prescribed:
+      // drives week completion and the RIR engine's fallback when RPE is blank
+      mesoWeek: m ? m.week : null,
+      rirTarget: m && m.rir ? m.rir.lo : null,
+      feedback: isAdvanced(program) ? { soreness: {}, post: {} } : null,
+      gym: lastGym.current || null,
+      injuries: injuries.filter(i => !i.closed).map(i => ({ name: i.name, pain: 0, swelling: false, note: "" }))
+    };
+    /* free session: no program day, no targets. Exercises come in through the
+       picker, which opens straight away, and prefill from your history. */
+    if (activeDayId === FREE_DAY) {
+      setDraft({ ...base, dayId: null, dayName: "Free session", entries: [] });
+      setViewSession(null); setTab("log");
+      setPicker({ onPick: k => { addExerciseToDraft(k); setPicker(null); }, initialQ: "" });
+      return;
+    }
+    const day = program.days.find(d => d.id === activeDayId);
+    if (!day) return;
+    let wrIndex = 0;
+    // Advanced: last joint-pain answer per muscle, to flag those exercises
+    const lastJoint = {};
+    if (isAdvanced(program)) for (let i = sessions.length - 1; i >= 0; i--) {
+      const post = sessions[i].feedback && sessions[i].feedback.post;
+      if (post) Object.keys(post).forEach(mu => { if (!(mu in lastJoint) && post[mu].joint) lastJoint[mu] = post[mu].joint; });
+    }
+    setDraft({
+      ...base, dayId: day.id, dayName: day.name,
+      entries: day.items.map(it => {
+        const ex = exByKey(it.key); if (!ex) return null;
+        const pf = prefillFor(it.key, it.target, ex.t, ex.n, { wrIndex });
+        if (ex.t === "wr") wrIndex++;
+        const nSets = it.target?.sets || 1;
+        const jp = lastJoint[ex.m];
+        const jNote = jp === "lots" || jp === "some" ? `${jp === "lots" ? "Lots of" : "Some"} joint pain last ${ex.m.toLowerCase()} session. Consider a different exercise` : "";
+        return { eid: uid(), key: it.key, name: ex.n, t: ex.t, note: "", group: null,
+          est: pf.est, target: pf.target, ghostW: pf.ghostW, ghostR: pf.ghostR, ghostAdd: pf.ghostAdd || "",
+          plan: pf.plan || null, progNote: [pf.progNote, jNote].filter(Boolean).join(". "), progKind: jNote ? "deload" : pf.progKind || "",
+          sets: Array.from({ length: nSets }, () => blankSet(ex.t)) };
+      }).filter(Boolean)
+    });
+    setViewSession(null); setTab("log");
+  }, [program, activeDayId, exByKey, prefillFor, injuries, addExerciseToDraft, sessions]);
+
 
   const saveSession = useCallback(async () => {
     const notEmpty = (t, s) => ({
@@ -665,8 +837,9 @@ function App() {
       entries: draft.entries.map(e => ({
         key: e.key, name: e.name, t: e.t, note: e.note || "",
         ...(e.group ? { group: e.group } : {}),
-        sets: e.sets.filter(s => notEmpty(e.t, s)).map(s => {
-          const dropFlag = s.drop ? { drop: true } : {};
+        // a drop can't lead an exercise (happens when the row above it was left empty)
+        sets: e.sets.filter(s => notEmpty(e.t, s)).map((s, si) => {
+          const dropFlag = s.drop && si > 0 ? { drop: true } : {};
           if (e.t === "wr") return { w: num(s.w), r: num(s.r), rpe: s.rpe === "" ? null : Number(s.rpe), ...dropFlag };
           if (e.t === "rep") return { r: num(s.r), add: (s.add === "" || s.add == null) ? null : (Number(s.add) || 0), rpe: s.rpe === "" ? null : Number(s.rpe), ...dropFlag };
           if (e.t === "time") return { sec: num(s.sec) };
@@ -719,8 +892,9 @@ function App() {
     setDraft(null); setTab("history");
     // EWS readout: score, and delta vs the previous session of the same program day
     const ews = scoreSession(clean, next, exByKey, program ? program.days : null);
-    const prevSame = sessions.filter(s => s.id !== clean.id && s.dayId === clean.dayId && s.date <= clean.date)
-      .sort((a, b) => a.date < b.date ? 1 : -1)[0];
+    // (free sessions have no day, so there is nothing like-for-like to compare)
+    const prevSame = clean.dayId ? sessions.filter(s => s.id !== clean.id && s.dayId === clean.dayId && s.date <= clean.date)
+      .sort((a, b) => a.date < b.date ? 1 : -1)[0] : null;
     let ewsMsg = ` EWS ${fmtEws(ews.total)}`;
     if (prevSame) { const d = ews.total - scoreSession(prevSame, next, exByKey, program ? program.days : null).total; ewsMsg += `, ${d >= 0 ? "up" : "down"} ${fmtEws(Math.abs(d))} on last time`; }
     flash((existingIdx >= 0 ? "Workout updated." : "Workout saved.") + (prCount ? ` ${prCount} PR${prCount > 1 ? "s" : ""}.` : "") + ewsMsg + ".");
@@ -750,6 +924,7 @@ function App() {
       .map(i => ({ name: i.name, pain: 0, swelling: false, note: "" }));
     const draftFromSession = {
       id: session.id, date: session.date, dayId: session.dayId, dayName: session.dayName,
+      mesoWeek: session.mesoWeek ?? null, rirTarget: session.rirTarget ?? null, feedback: session.feedback || null,
       gym: session.gym || null,
       bodyweight: toStr(session.bodyweight),
       durationMin: session.durationMin ?? null,
@@ -793,19 +968,20 @@ function App() {
 
   /* ---- import/export ---- */
   const exportJson = useCallback(() => {
-    const data = { program, custom, sessions, injuries, gyms, exportedAt: new Date().toISOString() };
+    const data = { program, custom, sessions, injuries, gyms, videos, exportedAt: new Date().toISOString() };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = `gym-backup-${TODAY()}.json`; a.click();
     URL.revokeObjectURL(a.href);
-  }, [program, custom, sessions, injuries, gyms]);
+  }, [program, custom, sessions, injuries, gyms, videos]);
   const importJson = useCallback(async file => {
     try {
       const d = JSON.parse(await file.text());
-      if (d.program && d.program.days) { const p = migrate(d.program); setProgram(p); setActiveDayId(p.days[0]?.id ?? null); await sSet("program:current", p); }
+      if (d.program && d.program.days) { const p = migrate(d.program); setProgram(p); setActiveDayId(p.days[0]?.id ?? FREE_DAY); await sSet("program:current", p); }
       if (Array.isArray(d.custom)) { setCustom(d.custom); await sSet("library:custom", d.custom); }
       if (Array.isArray(d.injuries)) { setInjuries(d.injuries); await sSet("injuries:list", d.injuries); }
       if (Array.isArray(d.gyms)) { setGyms(d.gyms); await sSet("gyms:list", d.gyms); }
+      if (d.videos && typeof d.videos === "object") { setVideos(d.videos); await sSet("library:videos", d.videos); }
       if (Array.isArray(d.sessions)) {
         const migrated = d.sessions.map(migrateSession);
         setSessions(migrated);
@@ -820,22 +996,27 @@ function App() {
 
   /* ---- generated mesocycle program ---- */
   const installGenerated = useCallback(async prog => {
-    const p = { ...prog };
-    if (p.meso) p.meso.startedOn = TODAY();
+    const mode = program && program.feedbackMode;
+    const p = { ...prog, ...(mode ? { feedbackMode: mode } : {}) };
+    if (p.meso) p.meso = { ...p.meso, startedOn: TODAY(), weekStartedOn: TODAY(), lastAuto: null };
+    if (isAdvanced(p)) p.meso = { ...p.meso, vol: weekVolume(p.meso, 1), volHist: {} };
     await saveProgram(p);
-    setActiveDayId(p.days[0]?.id ?? null);
+    setActiveDayId(p.days[0]?.id ?? FREE_DAY);
     setTab("log");
     flash("New program ready to log.");
-  }, [saveProgram, flash]);
+  }, [program, saveProgram, flash]);
 
   const advanceWeek = useCallback(async () => {
     if (!program || !program.meso) return;
     const next = Math.min(program.meso.week + 1, program.meso.totalWeeks);
-    const updated = applyWeek(program, next);
+    const r = stepTo(program, sessions, next);
+    // starting a week early: it runs 7 days from today
+    const updated = { ...r.program, meso: { ...r.program.meso, weekStartedOn: TODAY(), lastAuto: null } };
     await saveProgram(updated);
     const st = mesoStatus(updated);
-    flash(st && st.isDeload ? "Deload week. Keep the weights light." : `Now on week ${next}.`);
-  }, [program, saveProgram, flash]);
+    const vn = r.notes.length ? ` Sets: ${fmtVolNotes(r.notes)}.` : "";
+    flash(r.early ? `Deload brought forward: ${r.ceilings.join(" and ")} hit their limit.` : st && st.isDeload ? "Deload week. Keep the weights light." : `Now on week ${r.week}.${vn}`);
+  }, [program, sessions, saveProgram, flash]);
 
   const exitMeso = useCallback(async () => {
     if (!program) return;
@@ -845,8 +1026,99 @@ function App() {
     flash("Mesocycle ended. The program stays and is now fully editable.");
   }, [program, saveProgram, flash]);
 
+  /* reopen the previous week for 7 days from today (missed workouts) */
+  const goBackWeek = useCallback(async to => {
+    const m = program && program.meso;
+    if (!m || m.week <= 1) return;
+    const prev = typeof to === "number" ? Math.max(1, Math.min(m.week - 1, to)) : m.week - 1;
+    // Advanced: put back the sets that week had
+    const base = m.volHist && m.volHist[prev] ? { ...program, meso: { ...m, vol: m.volHist[prev] } } : program;
+    const p = applyWeek(base, prev);
+    await saveProgram({ ...p, meso: { ...p.meso, weekStartedOn: TODAY(), lastAuto: null } });
+    flash(`Back on week ${prev}. It runs 7 days from today, then moves on again.`);
+  }, [program, saveProgram, flash]);
+  const dismissAutoNote = useCallback(async () => {
+    if (!program || !program.meso || !program.meso.lastAuto) return;
+    await saveProgram({ ...program, meso: { ...program.meso, lastAuto: null } });
+  }, [program, saveProgram]);
+
+  /* weeks move on the calendar; checked on load and whenever the app comes back to the foreground */
+  useEffect(() => {
+    if (loading || !program || !program.meso) return;
+    const run = () => { const p = autoAdvance(program, sessions); if (p) saveProgram(p); };
+    run();
+    const onVis = () => { if (document.visibilityState === "visible") run(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [loading, program, sessions, saveProgram]);
+
+  /* Standard: fixed weekly ramp. Advanced: check-in questions set each
+     muscle's weekly sets. Switching mid-meso keeps this week's sets. */
+  const setFeedbackMode = useCallback(async mode => {
+    let p = { ...program, feedbackMode: mode };
+    const m = p.meso;
+    if (m && m.type !== "531") {
+      if (mode === "advanced" && !m.vol) p = { ...p, meso: { ...m, vol: weekVolume(m, m.week), volHist: m.volHist || {} } };
+      if (mode !== "advanced" && m.vol) { const { vol, ...rest } = m; p = { ...p, meso: rest }; }
+    }
+    await saveProgram(p);
+    flash(mode === "advanced" ? "Advanced: you'll get check-in questions during workouts." : "Standard: sets follow the fixed weekly ramp.");
+  }, [program, saveProgram, flash]);
+
   const openPicker = useCallback((onPick, initialQ) => setPicker({ onPick, initialQ: initialQ || "" }), []);
 
+  const saveVideo = useCallback(async (key, url) => {
+    setVideos(v => { const next = { ...v }; if (url) next[key] = url; else delete next[key]; sSet("library:videos", next); return next; });
+  }, []);
+
+  /* first-session load for a swapped-in exercise you've never logged:
+     converted from the old one's top weight where the two are comparable */
+  const convertedStart = useCallback((oldKey, oldTargetW, newEx) => {
+    const oldEx = exByKey(oldKey);
+    if (!oldEx || !newEx || newEx.t !== "wr" || lastForExercise(newEx.key)) return null;
+    const from = topWeight(lastForExercise(oldKey)) || Number(oldTargetW) || 0;
+    const w = convertLoad(oldEx.n, newEx.n, from);
+    return w ? { w, note: `Estimated from ${oldEx.n} (${from} kg). Adjust after the first set` } : null;
+  }, [exByKey, lastForExercise]);
+
+  /* swap in a live workout. scope "today" or "program" (also replaces the
+     slot in this program day). Sets already ticked stay with the old
+     exercise; the new one takes the sets that were left. */
+  const swapDraftEntry = useCallback((eid, newKey, scope) => {
+    const ex = exByKey(newKey); if (!ex) return;
+    const old = draft && draft.entries.find(e => e.eid === eid); if (!old) return;
+    const oldEx = exByKey(old.key);
+    const target = swapTarget(old.target, oldEx, ex);
+    const pf = prefillFor(newKey, target, ex.t, ex.n, { wrIndex: 0 });
+    const conv = convertedStart(old.key, old.target && old.target.w, ex);
+    const nDone = old.sets.filter(x => x.done).length;
+    const left = Math.max(1, old.sets.length - nDone);
+    const entry = { eid: uid(), key: newKey, name: ex.n, t: ex.t, note: "", group: old.group || null,
+      target: conv ? { ...(pf.target || {}), w: conv.w } : pf.target,
+      ghostW: conv ? String(conv.w) : pf.ghostW, ghostR: pf.ghostR, ghostAdd: pf.ghostAdd || "",
+      est: conv ? true : pf.est, plan: conv ? null : (pf.plan || null),
+      progNote: conv ? conv.note : (pf.progNote || ""), progKind: conv ? "" : (pf.progKind || ""),
+      sets: Array.from({ length: left }, () => blankSet(ex.t)) };
+    setDraft(d => {
+      const ents = [];
+      d.entries.forEach(e => {
+        if (e.eid !== eid) { ents.push(e); return; }
+        if (nDone > 0) ents.push({ ...e, sets: e.sets.filter(x => x.done) });
+        ents.push(entry);
+      });
+      return { ...d, entries: ents };
+    });
+    if (scope === "program" && draft.dayId && program) {
+      const days = program.days.map(d => d.id !== draft.dayId ? d : { ...d, items: d.items.map(it => it.key !== old.key ? it : {
+        ...it, key: newKey, est: false, ...(it.tier ? { tier: roleTier(ex.role) } : {}),
+        target: { ...swapTarget(it.target, oldEx, ex), ...(conv ? { w: conv.w } : {}) }
+      }) });
+      saveProgram({ ...program, days });
+    }
+    flash(`Swapped to ${ex.n}${scope === "program" ? " for the rest of the program" : " for today"}.`);
+  }, [draft, program, exByKey, prefillFor, convertedStart, saveProgram, flash]);
+
+  const openSwap = useCallback((fromKey, onPick, scopes) => setSwap({ fromKey, onPick, scopes: !!scopes }), []);
   if (loading) return <div className="boot">Loading</div>;
 
   const goTab = t => { setViewSession(null); setTab(t); window.scrollTo(0, 0); };
@@ -863,10 +1135,12 @@ function App() {
         {tab === "log" && (
           draft
             ? <DraftView draft={draft} setDraft={setDraft} onSave={saveSession} onDiscard={discardDraft} restPrefs={restPrefs} saveRestPrefs={saveRestPrefs}
-                lastForExercise={lastForExercise} exByKey={exByKey} gyms={gyms}
-                onAddExercise={() => openPicker(k => { addExerciseToDraft(k); setPicker(null); })} />
+                lastForExercise={lastForExercise} exByKey={exByKey} gyms={gyms} advanced={isAdvanced(program) && !!draft.feedback}
+                onAddExercise={() => openPicker(k => { addExerciseToDraft(k); setPicker(null); })}
+                onHowTo={setHowTo}
+                onSwap={e => openSwap(e.key, (k, scope) => swapDraftEntry(e.eid, k, scope), !!draft.dayId)} />
             : <StartView program={program} activeDayId={activeDayId} setActiveDayId={setActiveDayId} onStart={startSession} sessions={sessions}
-                onOpenProgram={() => goTab("program")} />
+                onOpenProgram={() => goTab("program")} onGoBackWeek={goBackWeek} onDismissAuto={dismissAutoNote} />
         )}
         {tab === "history" && (
           viewSession
@@ -877,10 +1151,15 @@ function App() {
         {tab === "program" && <ProgramTab program={program} setProgram={saveProgram} exByKey={exByKey}
           openPicker={openPicker} custom={custom} removeCustom={removeCustom} updateCustom={updateCustom}
           exportJson={exportJson} importJson={importJson} onReset={resetProgram}
-          onAdvanceWeek={advanceWeek} onExitMeso={exitMeso} restPrefs={restPrefs} saveRestPrefs={saveRestPrefs}
-          injuries={injuries} saveInjuries={saveInjuries} sessions={sessions} onInstall={installGenerated} />}
+          onAdvanceWeek={advanceWeek} onGoBackWeek={goBackWeek} onExitMeso={exitMeso} onSetMode={setFeedbackMode} restPrefs={restPrefs} saveRestPrefs={saveRestPrefs}
+          injuries={injuries} saveInjuries={saveInjuries} sessions={sessions} onInstall={installGenerated}
+          openSwap={openSwap} onHowTo={setHowTo} convertedStart={convertedStart} />}
       </div>
+      {swap && <SwapSheet from={exByKey(swap.fromKey)} allEx={allEx} lastForExercise={lastForExercise} scopes={swap.scopes}
+        onPick={(k, scope) => { swap.onPick(k, scope); setSwap(null); }} onHowTo={setHowTo} onClose={() => setSwap(null)}
+        onBrowse={() => { const s0 = swap; setSwap(null); const from = exByKey(s0.fromKey); openPicker(k => { s0.onPick(k, "today"); setPicker(null); }, from ? from.m : ""); }} />}
       {picker && <Picker custom={custom} onAddCustom={addCustom} onPick={picker.onPick} initialQ={picker.initialQ} onClose={() => setPicker(null)} />}
+      {howTo && <HowToSheet ex={exByKey(howTo)} video={videos[howTo]} onSaveVideo={url => saveVideo(howTo, url)} onClose={() => setHowTo(null)} />}
       {toast && <div className="toast" role="status">{toast}</div>}
       <TabBar tab={tab} setTab={goTab} logging={!!draft} />
     </div>
@@ -905,6 +1184,9 @@ const ICONS = {
   check: <path d="M5 12.5l4.5 4.5L19 7.5" />,
   more: <><circle cx="5.5" cy="12" r="1.6" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" /><circle cx="18.5" cy="12" r="1.6" fill="currentColor" stroke="none" /></>,
   search: <><circle cx="10.5" cy="10.5" r="6.5" /><path d="M15.5 15.5L20 20" /></>,
+  info: <><circle cx="12" cy="12" r="8.5" /><path d="M12 11v5.5M12 7.6v.01" /></>,
+  swap: <path d="M7 7.5h11.5l-3-3M17 16.5H5.5l3 3" />,
+  play: <path d="M8 5.5v13l10.5-6.5z" />,
   copy: <><rect x="8.5" y="8.5" width="11" height="11" rx="2" /><path d="M15.5 8.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" /></>
 };
 function Icon({ n, s = 22, w = 1.9 }) {
@@ -1065,27 +1347,65 @@ function GroupLabel({ children, right }) {
 /* ============================================================
    Log: choose a workout
    ============================================================ */
-function StartView({ program, activeDayId, setActiveDayId, onStart, sessions, onOpenProgram }) {
+function StartView({ program, activeDayId, setActiveDayId, onStart, sessions, onOpenProgram, onGoBackWeek, onDismissAuto }) {
   const thisWeek = isoWeek(TODAY());
-  const doneThisWeek = sessions.filter(s => isoWeek(s.date) === thisWeek).length;
   const st = mesoStatus(program);
+  const m = program.meso;
+  /* on a meso, "this week" is the meso week (program days done in it);
+     otherwise the calendar week */
+  const mesoDone = useMemo(() => m ? mesoWeekDone(program, sessions, m.week) : null, [program, sessions, m]);
+  const doneThisWeek = mesoDone ? mesoDone.size : sessions.filter(s => isoWeek(s.date) === thisWeek).length;
+  const weekTarget = mesoDone ? program.days.length : program.target;
+  const weekEnds = m && m.weekStartedOn ? addDays(m.weekStartedOn, 7) : null;
+  const mesoOver = !!(m && weekEnds && m.week >= m.totalWeeks && weekEnds <= TODAY());
+  const auto = m && m.lastAuto && m.lastAuto.to === m.week ? m.lastAuto : null;
+  const autoPrevDone = useMemo(() => auto ? mesoWeekDone(program, sessions, auto.from).size : 0, [auto, program, sessions]);
   const lastByDay = useMemo(() => {
     const m = {};
-    sessions.forEach(s => { if (s.dayId && (!m[s.dayId] || s.date > m[s.dayId])) m[s.dayId] = s.date; });
+    sessions.forEach(s => { const k = s.dayId || FREE_DAY; if (!m[k] || s.date > m[k]) m[k] = s.date; });
     return m;
   }, [sessions]);
-  const pct = program.target > 0 ? Math.min(100, (doneThisWeek / program.target) * 100) : 0;
+  const pct = weekTarget > 0 ? Math.min(100, (doneThisWeek / weekTarget) * 100) : 0;
   const active = program.days.find(d => d.id === activeDayId);
+  const isFree = activeDayId === FREE_DAY;
+  const lastFree = lastByDay[FREE_DAY];
   return (
     <div>
       <NavBar large title="Log" right={st && <span className={cx("status-pill", st.isDeload && "deload")}>{st.label}</span>} />
 
+      {auto && (
+        <div className="group" style={{ marginTop: 8 }}>
+          <div className="row" style={{ display: "block" }}>
+            <div className="row-title">{auto.early ? "Deload brought forward" : st && st.isDeload ? "Deload week started" : `Week ${auto.to} started`}</div>
+            {auto.early && <div className="row-sub">{(auto.ceilings || []).join(" and ")} hit their limit, so recovery comes first.</div>}
+            {!auto.early && auto.notes && auto.notes.length > 0 && <div className="row-sub">Sets this week: {fmtVolNotes(auto.notes)}</div>}
+            <div className="row-sub">Week {auto.from}: {autoPrevDone} of {plural(program.days.length, "workout")} logged.{autoPrevDone < program.days.length ? " Go back to finish it, or carry on." : ""}</div>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            {autoPrevDone < program.days.length && <button className="btn btn-tinted btn-sm" style={{ flex: 1, minHeight: 40 }} onClick={() => onGoBackWeek(auto.from)}>Go back to week {auto.from}</button>}
+            <button className="btn btn-secondary btn-sm" style={{ flex: 1, minHeight: 40 }} onClick={onDismissAuto}>{autoPrevDone < program.days.length ? "Carry on" : "OK"}</button>
+          </div>
+        </div>
+      )}
+      {mesoOver && (
+        <div className="group" style={{ marginTop: 8 }}>
+          <button className="row" onClick={onOpenProgram}>
+            <div className="row-main">
+              <div className="row-title acc">Mesocycle complete</div>
+              <div className="row-sub">Deload done. Build the next block in Program.</div>
+            </div>
+            <span className="row-chev"><Icon n="chevR" s={18} /></span>
+          </button>
+        </div>
+      )}
+
       <div className="group" style={{ marginTop: 8 }}>
         <div className="row" style={{ display: "block", paddingTop: 14, paddingBottom: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-            <span className="row-title">This week</span>
-            <span className="row-value"><b style={{ color: C.ink }}>{doneThisWeek}</b> of {program.target} workouts</span>
+            <span className="row-title">{m ? `Week ${m.week}` : "This week"}</span>
+            <span className="row-value"><b style={{ color: C.ink }}>{doneThisWeek}</b> of {weekTarget} workouts</span>
           </div>
+          {weekEnds && !mesoOver && <div className="row-sub">{m.week >= m.totalWeeks ? "Mesocycle ends" : `Week ${m.week + 1} starts`} {fmtDay(weekEnds)}</div>}
           <div style={{ height: 6, borderRadius: 3, background: C.surface3, marginTop: 10, overflow: "hidden" }}>
             <div style={{ height: "100%", width: `${pct}%`, background: pct >= 100 ? C.good : C.acc, borderRadius: 3, transition: "width .3s" }} />
           </div>
@@ -1102,27 +1422,33 @@ function StartView({ program, activeDayId, setActiveDayId, onStart, sessions, on
       </div>
 
       <GroupLabel>Choose a workout</GroupLabel>
-      {program.days.length === 0 ? (
-        <div className="group"><button className="row" onClick={onOpenProgram}><span className="row-main row-title acc">Add workout days in Program</span><span className="row-chev"><Icon n="chevR" s={18} /></span></button></div>
-      ) : (
-        <div className="group" role="radiogroup">
-          {program.days.map(d => {
-            const last = lastByDay[d.id];
-            const on = activeDayId === d.id;
-            return (
-              <button key={d.id} role="radio" aria-checked={on} className={cx("row", on && "selected")} onClick={() => setActiveDayId(d.id)}>
-                <div className="row-main">
-                  <div className="row-title">{d.name}</div>
-                  <div className="row-sub">{plural(d.items.length, "exercise")}{last ? `, last done ${lastDoneLabel(last)}` : ""}</div>
-                </div>
-                <span className="check" style={{ visibility: on ? "visible" : "hidden" }}><Icon n="check" w={2.4} /></span>
-              </button>
-            );
-          })}
-        </div>
+      <div className="group" role="radiogroup">
+        {program.days.map(d => {
+          const last = lastByDay[d.id];
+          const on = activeDayId === d.id;
+          return (
+            <button key={d.id} role="radio" aria-checked={on} className={cx("row", on && "selected")} onClick={() => setActiveDayId(d.id)}>
+              <div className="row-main">
+                <div className="row-title">{d.name}</div>
+                <div className="row-sub">{plural(d.items.length, "exercise")}{mesoDone && mesoDone.has(d.id) ? ", done this week" : last ? `, last done ${lastDoneLabel(last)}` : ""}</div>
+              </div>
+              <span className="check" style={{ visibility: on ? "visible" : "hidden" }}><Icon n="check" w={2.4} /></span>
+            </button>
+          );
+        })}
+        <button role="radio" aria-checked={isFree} className={cx("row", isFree && "selected")} onClick={() => setActiveDayId(FREE_DAY)}>
+          <div className="row-main">
+            <div className="row-title">Free session</div>
+            <div className="row-sub">No plan, add exercises as you go{lastFree ? `. Last done ${lastDoneLabel(lastFree)}` : ""}</div>
+          </div>
+          <span className="check" style={{ visibility: isFree ? "visible" : "hidden" }}><Icon n="check" w={2.4} /></span>
+        </button>
+      </div>
+      {program.days.length === 0 && (
+        <div className="group" style={{ marginTop: 12 }}><button className="row" onClick={onOpenProgram}><span className="row-main row-title acc">Add workout days in Program</span><span className="row-chev"><Icon n="chevR" s={18} /></span></button></div>
       )}
-      {active && (
-        <button className="btn btn-primary block" style={{ marginTop: 20 }} onClick={onStart}>Start {active.name}</button>
+      {(active || isFree) && (
+        <button className="btn btn-primary block" style={{ marginTop: 20 }} onClick={onStart}>{isFree ? "Start free session" : `Start ${active.name}`}</button>
       )}
     </div>
   );
@@ -1131,7 +1457,7 @@ function StartView({ program, activeDayId, setActiveDayId, onStart, sessions, on
 /* ============================================================
    Log: workout in progress
    ============================================================ */
-function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKey, onAddExercise, gyms, restPrefs, saveRestPrefs }) {
+function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKey, onAddExercise, gyms, restPrefs, saveRestPrefs, advanced, onHowTo, onSwap }) {
   // ensure every entry has a stable id (handles drafts created before eid existed)
   useEffect(() => {
     if ((draft.entries || []).some(e => !e.eid)) {
@@ -1145,6 +1471,36 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
     const [x] = a.splice(from, 1); a.splice(to, 0, x); return { ...d, entries: a };
   });
   const live = !!draft.startedAt;
+
+  /* ---- Advanced check-ins ----
+     fbMuscles: muscles in this workout, with set progress and whether you've
+     trained them before (soreness only makes sense then). When every set of a
+     muscle is ticked, its check-in sheet opens once. */
+  const fbMuscles = useMemo(() => {
+    if (!advanced) return [];
+    const order = [], info = {};
+    draft.entries.forEach(e => {
+      const ex = exByKey(e.key); const mu = ex && ex.m;
+      if (!mu || !LANDMARKS[mu]) return;
+      if (!info[mu]) { info[mu] = { muscle: mu, sets: 0, done: 0, before: false }; order.push(mu); }
+      info[mu].sets += e.sets.length; info[mu].done += e.sets.filter(s => s.done).length;
+      if (lastForExercise(e.key)) info[mu].before = true;
+    });
+    return order.map(m => info[m]);
+  }, [advanced, draft.entries, exByKey, lastForExercise]);
+  const fb = draft.feedback || { soreness: {}, post: {} };
+  const setFb = (kind, mu, val) => setDraft(d => {
+    const f = d.feedback || { soreness: {}, post: {} };
+    if (kind === "soreness") return { ...d, feedback: { ...f, soreness: { ...f.soreness, [mu]: val } } };
+    return { ...d, feedback: { ...f, post: { ...f.post, [mu]: { ...(f.post[mu] || {}), ...val } } } };
+  });
+  const [fbSheet, setFbSheet] = useState(null);
+  const prompted = useRef(new Set(Object.keys(fb.post || {})));
+  useEffect(() => {
+    if (!advanced || !live) return;
+    const doneMu = fbMuscles.find(x => x.sets > 0 && x.done === x.sets && !prompted.current.has(x.muscle));
+    if (doneMu) { prompted.current.add(doneMu.muscle); setFbSheet(doneMu.muscle); }
+  }, [advanced, live, fbMuscles]);
 
   /* elapsed workout clock (live workouts only, not edits) */
   const [nowTick, setNowTick] = useState(Date.now());
@@ -1263,6 +1619,8 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
         </div>
       </div>
 
+      {advanced && <SorenessCard muscles={fbMuscles.filter(x => x.before)} fb={fb} setFb={setFb} />}
+
       {draft.entries.length === 0 && (
         <Empty title="No exercises yet" msg="Add the first exercise to start logging." />
       )}
@@ -1273,6 +1631,7 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
           ss={groupInfo(e)} pairing={pairing} pairingName={pairingEntry ? pairingEntry.name : ""}
           restOverride={restPrefs.byEx && restPrefs.byEx[e.key]} restDefault={restPrefs.len}
           onRestPick={() => setRestPick({ scope: "ex", key: e.key, name: e.name })}
+          onHowTo={onHowTo} onSwap={onSwap}
           onPairStart={() => setPairing(e.eid)}
           onPairWith={() => pairWith(e.eid)}
           onUnlink={() => unlink(e.eid)} />
@@ -1298,6 +1657,25 @@ function DraftView({ draft, setDraft, onSave, onDiscard, lastForExercise, exByKe
           <span className="row-chev"><Icon n="chevR" s={18} /></span>
         </button>
       </div>
+
+      {advanced && fbMuscles.length > 0 && (
+        <>
+          <GroupLabel>Muscle check-in</GroupLabel>
+          <div className="group">
+            {fbMuscles.map(x => (
+              <button key={x.muscle} className="row" onClick={() => setFbSheet(x.muscle)}>
+                <div className="row-main">
+                  <div className="row-title">{x.muscle}</div>
+                  <div className={cx("row-sub", !fbSummary(fb.post[x.muscle]) && "acc")}>{fbSummary(fb.post[x.muscle]) || "Not rated yet"}</div>
+                </div>
+                <span className="row-chev"><Icon n="chevR" s={18} /></span>
+              </button>
+            ))}
+          </div>
+          <div className="group-foot">Asked after each muscle's last set. Your answers set next week's sets for that muscle.</div>
+        </>
+      )}
+      {fbSheet && <CheckinSheet muscle={fbSheet} value={fb.post[fbSheet] || {}} onChange={patch => setFb("post", fbSheet, patch)} onClose={() => setFbSheet(null)} />}
 
       <FeelRating draft={draft} setDraft={setDraft} />
       <DraftInjuries draft={draft} setDraft={setDraft} />
@@ -1414,33 +1792,89 @@ function RestPicker({ title, value, fallback, onPick, onClose }) {
   );
 }
 
+/* ---- set reordering ----
+   A regular set and the drop rows under it form a block. Moving a regular set
+   moves its whole block past the neighbouring block. Moving a drop moves that
+   one row, so it can hop onto a different set; it can never become row 1. */
+const blockEnd = (a, i) => { let j = i + 1; while (j < a.length && a[j].drop) j++; return j; }; // exclusive
+const blockStart = (a, i) => { let j = i; while (j > 0 && a[j].drop) j--; return j; };
+function canMoveSet(a, i, dir) {
+  if (!a[i]) return false;
+  if (a[i].drop) { const j = i + dir; return j >= 1 && j < a.length; }
+  return dir < 0 ? i > 0 : blockEnd(a, i) < a.length;
+}
+/* returns { sets, to } with the new array and the row's new index, or null */
+function moveSetRow(sets, i, dir) {
+  if (!canMoveSet(sets, i, dir)) return null;
+  const a = sets.slice();
+  if (a[i].drop) {
+    const j = i + dir;
+    [a[i], a[j]] = [a[j], a[i]];
+    return { sets: a, to: j };
+  }
+  const end = blockEnd(a, i);
+  const blk = a.splice(i, end - i);
+  if (dir < 0) {
+    const p = blockStart(a, i - 1);
+    a.splice(p, 0, ...blk);
+    return { sets: a, to: p };
+  }
+  // the next block now starts at i
+  const ins = blockEnd(a, i);
+  a.splice(ins, 0, ...blk);
+  return { sets: a, to: ins };
+}
+
 /* ============================================================
    One exercise inside a live workout
    ============================================================ */
-function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex, onSetDone, ss, pairing, pairingName, onPairStart, onPairWith, onUnlink, restOverride, restDefault, onRestPick }) {
+function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex, onSetDone, ss, pairing, pairingName, onPairStart, onPairWith, onUnlink, restOverride, restDefault, onRestPick, onHowTo, onSwap }) {
   const blank = blankSet(entry.t);
   const [collapsed, setCollapsed] = useState(false);
   const [plates, setPlates] = useState(false);
   const [menu, setMenu] = useState(false);
   const [setMenuIdx, setSetMenuIdx] = useState(null);
+  const [reorder, setReorder] = useState(false);
+  const canDrop = entry.t === "wr" || entry.t === "rep";
   // a new normal set copies the last NON-drop row (a drop row is not a template for a fresh set)
   const addSet = () => setEntry(entry.eid, e => {
     const tmpl = [...e.sets].reverse().find(s => !s.drop) || e.sets[e.sets.length - 1] || blank;
     const { drop, ...rest } = tmpl;
     return { ...e, sets: [...e.sets, { ...rest, done: false }] };
   });
-  // drop row: continues the row above with no rest. Weight left blank so the
-  // placeholder (about 20% lighter than the row above) shows; reps blank too.
-  const addDrop = () => setEntry(entry.eid, e => {
-    if (!e.sets.length) return e;
-    const last = e.sets[e.sets.length - 1];
-    const row = { ...last, done: false, drop: true, r: "", rpe: "" };
+  /* drop row: continues the row above with no rest. It goes at the end of the
+     chosen set's drops, so a set's drops stay together. Weight left blank so
+     the placeholder (about 20% lighter than the row above) shows; reps blank. */
+  const addDropAfter = i => setEntry(entry.eid, e => {
+    if (!e.sets.length || i < 0) return e;
+    const j = blockEnd(e.sets, Math.min(i, e.sets.length - 1));
+    const row = { ...e.sets[j - 1], done: false, drop: true, r: "", rpe: "" };
     if ("w" in row) row.w = "";
-    return { ...e, sets: [...e.sets, row] };
+    const a = e.sets.slice(); a.splice(j, 0, row);
+    return { ...e, sets: a };
   });
-  const rmSet = i => setEntry(entry.eid, e => ({ ...e, sets: e.sets.filter((_, j) => j !== i) }));
+  const addDrop = () => addDropAfter(entry.sets.length - 1);
+  const rmSet = i => setEntry(entry.eid, e => {
+    const a = e.sets.filter((_, j) => j !== i);
+    // removing row 1 would leave a drop leading the exercise: promote it
+    if (a[0] && a[0].drop) { const { drop, ...r } = a[0]; a[0] = r; }
+    return { ...e, sets: a };
+  });
   const toggleDrop = i => setEntry(entry.eid, e => ({ ...e, sets: e.sets.map((s, j) => j === i ? (s.drop ? (({ drop, ...r }) => r)(s) : { ...s, drop: true }) : s) }));
   const upd = (i, k, v) => setEntry(entry.eid, e => ({ ...e, sets: e.sets.map((s, j) => j === i ? { ...s, [k]: v } : s) }));
+  /* move a row and keep it under the finger, so repeated taps keep moving it */
+  const moveRow = (ev, i, dir) => {
+    const rowEl = ev.currentTarget.closest("[data-row]");
+    const card = ev.currentTarget.closest("section");
+    const before = rowEl ? rowEl.getBoundingClientRect().top : null;
+    const res = moveSetRow(entry.sets, i, dir);
+    if (!res) return;
+    setEntry(entry.eid, e => ({ ...e, sets: res.sets }));
+    if (card && before != null) requestAnimationFrame(() => {
+      const el = card.querySelector(`[data-row="${res.to}"]`);
+      if (el) { const d = el.getBoundingClientRect().top - before; if (d) window.scrollBy(0, d); }
+    });
+  };
   /* Ticking a set accepts the suggested values: any empty field takes its
      placeholder (the plan, last time, or the target), so a set done exactly
      as suggested is one tap and actually gets saved. RPE is never guessed. */
@@ -1486,7 +1920,7 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
   const bwl = isBwLoaded(entry.key);
   const cols = { wr: [bwl ? "+kg" : "kg", "Reps", "RPE"], rep: ["Reps", "Assist kg", "RPE"], time: ["Seconds"], wd: ["kg", "Metres"], cardio: ["Minutes", "km"] }[entry.t];
   const keys = { wr: ["w", "r", "rpe"], rep: ["r", "add", "rpe"], time: ["sec"], wd: ["w", "dist"], cardio: ["min", "dist"] }[entry.t];
-  const grid = { gridTemplateColumns: `44px ${keys.map(k => k === "rpe" ? "0.8fr" : "1fr").join(" ")} 44px` };
+  const grid = { gridTemplateColumns: `44px ${keys.map(k => k === "rpe" ? "0.8fr" : "1fr").join(" ")} ${reorder ? "92px" : "44px"}` };
   const hint = targetHint(entry.t, entry.target);
   const rp = !hint ? rpHint(ex) : null;
   const prevStr = prev ? prevSummary(entry.t, prev, entry.key) : null;
@@ -1503,9 +1937,11 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
       return d ? String(d) : "";
     }
     if (row && row.drop && k === "r") return "";
-    // per-set plan (double progression / 5/3/1 percents) wins; then program
-    // target; then computed ghost (last session / seed).
-    const p = entry.plan && entry.plan[i != null ? Math.min(i, entry.plan.length - 1) : 0];
+    // per-set plan (RIR engine / double progression / 5/3/1 percents) wins; then
+    // program target; then computed ghost (last session / seed). The plan is
+    // indexed by working set, so drop rows in between don't shift it.
+    const workIdx = i != null ? entry.sets.slice(0, i).filter(x => !x.drop).length : 0;
+    const p = entry.plan && entry.plan[Math.min(workIdx, entry.plan.length - 1)];
     if (p) {
       if (k === "w" && p.w) return p.w;
       if (k === "r" && p.r) return p.r;
@@ -1536,6 +1972,7 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
   const showPairTarget = pairing && !iAmPairing;
   const restLabel = restOverride != null ? fmtRest(restOverride) : `default, ${fmtRest(restDefault)}`;
   const allDone = nDone === entry.sets.length && entry.sets.length > 0;
+  const arrowBtn = { width: 44, height: 44, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", background: C.surface2, color: C.ink };
 
   return (
     <section data-move className={cx("ex", ss && "ss", iAmPairing && "ss-pick")} aria-label={entry.name}>
@@ -1549,6 +1986,7 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
             {ss && <div>Superset {ss.letter}: rest starts after {ss.letter}{ss.size}</div>}
           </div>
         </button>
+        {onHowTo && <button className="icon-btn" aria-label={`How to do ${entry.name}`} onClick={() => onHowTo(entry.key)}><Icon n="info" /></button>}
         {count > 1 && <MoveBtns index={index} count={count} onMove={onMove} name={entry.name} />}
         <button className="icon-btn" aria-label={`More for ${entry.name}`} onClick={() => setMenu(true)}><Icon n="more" /></button>
       </div>
@@ -1557,10 +1995,16 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
         <div className={cx("ex-collapsed", allDone && "all")}>{nDone} of {plural(entry.sets.length, "set")} done</div>
       ) : (
         <>
-          {prevStr && (
+          {prevStr && !reorder && (
             <div className="ex-lines ex-last" style={{ padding: "0 16px 4px" }}>
               <span style={{ flex: 1, minWidth: 0 }}>Last time: <span className="dim num-t">{prevStr}</span></span>
               <button className="text-btn" onClick={useLast}>Copy</button>
+            </div>
+          )}
+          {reorder && (
+            <div className="ex-lines" style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 16px 4px" }}>
+              <span style={{ flex: 1, minWidth: 0 }}>A set moves with its drops. A drop moves one row and joins the set above it.</span>
+              <button className="text-btn" onClick={() => setReorder(false)}>Done</button>
             </div>
           )}
           <div className="sets">
@@ -1571,27 +2015,39 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
             </div>
             {entry.sets.map((s, i) => {
               const setNo = entry.sets.slice(0, i + 1).filter(x => !x.drop).length;
+              const label = s.drop ? `drop after set ${setNo}` : `set ${setNo}`;
+              const up = canMoveSet(entry.sets, i, -1), down = canMoveSet(entry.sets, i, 1);
               return (
-                <div key={i} className={cx("set-grid set-row", s.done && "done")} style={grid}>
-                  <button className={cx("set-no", s.drop && "drop")} aria-label={`Set ${s.drop ? "drop" : setNo} options`} onClick={() => setSetMenuIdx(i)}>
+                <div key={i} data-row={i} className={cx("set-grid set-row", s.done && "done")} style={grid}>
+                  <button className={cx("set-no", s.drop && "drop")} aria-label={`${label} options`} onClick={() => setSetMenuIdx(i)}>
                     {s.drop ? "Drop" : setNo}
                   </button>
                   {keys.map(k => (
-                    <input key={k} className="cell" inputMode="decimal" enterKeyHint="next" aria-label={`${cols[keys.indexOf(k)]}, set ${setNo}`}
+                    <input key={k} className="cell" inputMode="decimal" enterKeyHint="next" aria-label={`${cols[keys.indexOf(k)]}, ${label}`}
                       value={s[k] ?? ""} placeholder={ph(k, i)}
                       onFocus={ev => ev.target.select()} onChange={ev => upd(i, k, ev.target.value)} />
                   ))}
-                  <button className={cx("done-btn", s.done && "on")} aria-pressed={!!s.done} aria-label={s.done ? `Set ${setNo} done. Undo` : `Mark set ${setNo} done`} onClick={() => toggleDone(i)}>
-                    <Icon n="check" s={22} w={2.6} />
-                  </button>
+                  {reorder ? (
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <button style={{ ...arrowBtn, opacity: up ? 1 : .3 }} disabled={!up} aria-label={`Move ${label} up`} onClick={ev => moveRow(ev, i, -1)}><Icon n="chevU" s={20} w={2.2} /></button>
+                      <button style={{ ...arrowBtn, opacity: down ? 1 : .3 }} disabled={!down} aria-label={`Move ${label} down`} onClick={ev => moveRow(ev, i, 1)}><Icon n="chevD" s={20} w={2.2} /></button>
+                    </div>
+                  ) : (
+                    <button className={cx("done-btn", s.done && "on")} aria-pressed={!!s.done} aria-label={s.done ? `${label} done. Undo` : `Mark ${label} done`} onClick={() => toggleDone(i)}>
+                      <Icon n="check" s={22} w={2.6} />
+                    </button>
+                  )}
                 </div>
               );
             })}
           </div>
           <div className="set-actions" style={{ paddingLeft: 12 }}>
             <button className="text-btn" style={{ minHeight: 44, padding: "0 8px" }} onClick={addSet}><Icon n="plus" s={18} w={2.2} />Add set</button>
-            {(entry.t === "wr" || entry.t === "rep") && entry.sets.length > 0 && (
+            {canDrop && entry.sets.length > 0 && (
               <button className="text-btn" style={{ minHeight: 44, padding: "0 8px", color: C.ink2 }} onClick={addDrop}>Add drop set</button>
+            )}
+            {entry.sets.length > 1 && !reorder && (
+              <button className="text-btn" style={{ minHeight: 44, padding: "0 8px", color: C.ink2 }} onClick={() => setReorder(true)}>Reorder</button>
             )}
           </div>
           <div className="ex-note">
@@ -1604,22 +2060,31 @@ function ExerciseCard({ entry, index, count, onMove, setEntry, rmEntry, prev, ex
 
       {menu && (
         <ActionSheet onClose={() => setMenu(false)} message={entry.name} actions={[
+          onSwap && { label: "Swap for a similar exercise", onClick: () => onSwap(entry) },
+          onHowTo && { label: "How to do it", onClick: () => onHowTo(entry.key) },
           canSS && { label: ss ? `Add another exercise to superset ${ss.letter}` : "Superset with another exercise", onClick: onPairStart, disabled: count < 2 },
           ss && { label: `Remove from superset ${ss.letter}`, onClick: onUnlink },
+          entry.sets.length > 1 && { label: "Reorder sets", onClick: () => { setCollapsed(false); setReorder(true); } },
           onRestPick && { label: `Rest after this exercise (${restLabel})`, onClick: onRestPick },
           (entry.t === "wr" || entry.t === "wd") && !bwl && { label: "Plate calculator", onClick: () => setPlates(true) },
           { label: "Remove exercise", danger: true, onClick: () => rmEntry(entry.eid) }
         ]} />
       )}
-      {setMenuIdx != null && entry.sets[setMenuIdx] && (
-        <ActionSheet onClose={() => setSetMenuIdx(null)} actions={[
-          (entry.t === "wr" || entry.t === "rep") && setMenuIdx > 0 && {
-            label: entry.sets[setMenuIdx].drop ? "Make it a regular set" : "Make it a drop set (no rest before it)",
-            onClick: () => toggleDrop(setMenuIdx)
-          },
-          { label: "Remove this set", danger: true, onClick: () => rmSet(setMenuIdx) }
-        ]} />
-      )}
+      {setMenuIdx != null && entry.sets[setMenuIdx] && (() => {
+        const i = setMenuIdx, s = entry.sets[i];
+        const setNo = entry.sets.slice(0, i + 1).filter(x => !x.drop).length;
+        return (
+          <ActionSheet onClose={() => setSetMenuIdx(null)} message={s.drop ? `Drop after set ${setNo}` : `Set ${setNo}`} actions={[
+            canDrop && { label: s.drop ? `Add another drop to set ${setNo}` : "Add a drop after this set", onClick: () => addDropAfter(i) },
+            canDrop && i > 0 && {
+              label: s.drop ? "Make it a regular set" : "Make it a drop set (no rest before it)",
+              onClick: () => toggleDrop(i)
+            },
+            entry.sets.length > 1 && { label: "Reorder sets", onClick: () => setReorder(true) },
+            { label: "Remove this set", danger: true, onClick: () => rmSet(i) }
+          ]} />
+        );
+      })()}
       {plates && <PlateCalc initial={plateSeed()} onClose={() => setPlates(false)} />}
     </section>
   );
@@ -1691,6 +2156,68 @@ function prevSummary(t, sets, key) {
   if (t === "time") return sets.map(s => `${s.sec} s`).join(", ");
   if (t === "wd") return sets.map(s => `${s.w} kg ${s.dist} m`).join(", ");
   return sets.map(s => `${s.min || 0} min${s.dist ? ` ${s.dist} km` : ""}`).join(", ");
+}
+
+/* ---- Advanced check-in questions ---- */
+const FB_OPTS = {
+  soreness: [["early", "Healed early"], ["ontime", "On time"], ["sore", "Still sore"]],
+  pump: [["low", "Low"], ["ok", "OK"], ["great", "Great"]],
+  workload: [["easy", "Easy"], ["good", "Good"], ["limit", "At my limit"]],
+  joint: [["none", "None"], ["some", "Some"], ["lots", "Lots"]]
+};
+const fbLabel = (k, v) => (FB_OPTS[k].find(o => o[0] === v) || [])[1];
+function fbSummary(p) {
+  if (!p) return "";
+  const parts = [];
+  if (p.pump) parts.push(`pump ${fbLabel("pump", p.pump).toLowerCase()}`);
+  if (p.workload) parts.push(fbLabel("workload", p.workload).toLowerCase());
+  if (p.joint) parts.push(p.joint === "none" ? "no joint pain" : `${fbLabel("joint", p.joint).toLowerCase()} joint pain`);
+  const s = parts.join(", ");
+  return s ? s[0].toUpperCase() + s.slice(1) : "";
+}
+/* one question: equal-width chips, tap again to clear */
+function ChipRow({ label, sub, opts, value, onChange }) {
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div style={{ fontSize: 15, fontWeight: 600 }}>{label}</div>
+      {sub && <div className="muted small" style={{ marginTop: 2 }}>{sub}</div>}
+      <div role="radiogroup" aria-label={label} style={{ display: "grid", gridTemplateColumns: `repeat(${opts.length},1fr)`, gap: 8, marginTop: 8 }}>
+        {opts.map(([k, l]) => (
+          <button key={k} role="radio" aria-checked={value === k} className={cx("chip", value === k && "on")}
+            style={{ borderRadius: 10, minHeight: 44, padding: "0 6px", whiteSpace: "normal", lineHeight: 1.2 }}
+            onClick={() => onChange(value === k ? null : k)}>{l}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+/* after a muscle's last set */
+function CheckinSheet({ muscle, value, onChange, onClose }) {
+  const answered = ["pump", "workload", "joint"].filter(k => value[k]).length;
+  return (
+    <Sheet title={`${muscle} check-in`} onClose={onClose}
+      foot={<button className="btn btn-primary block" onClick={onClose}>{answered ? "Done" : "Skip"}</button>}>
+      <div className="muted small">Sets next week for {muscle.toLowerCase()} come from these answers. Skipped questions don't count.</div>
+      <ChipRow label="Pump" sub="How full did the muscle feel?" opts={FB_OPTS.pump} value={value.pump} onChange={v => onChange({ pump: v })} />
+      <ChipRow label="Workload" sub="How hard was the total work?" opts={FB_OPTS.workload} value={value.workload} onChange={v => onChange({ workload: v })} />
+      <ChipRow label="Joint pain" opts={FB_OPTS.joint} value={value.joint} onChange={v => onChange({ joint: v })} />
+    </Sheet>
+  );
+}
+/* before training: soreness from the last time each muscle was trained */
+function SorenessCard({ muscles, fb, setFb }) {
+  if (!muscles.length) return null;
+  return (
+    <>
+      <GroupLabel>Soreness since you last trained</GroupLabel>
+      <div className="group" style={{ padding: "2px 16px 16px" }}>
+        {muscles.map(x => (
+          <ChipRow key={x.muscle} label={x.muscle} opts={FB_OPTS.soreness} value={(fb.soreness || {})[x.muscle] || null} onChange={v => setFb("soreness", x.muscle, v)} />
+        ))}
+      </div>
+      <div className="group-foot">Healed early includes never getting sore.</div>
+    </>
+  );
 }
 
 /* session-level readiness: 1-10, higher = fresher. null = not set */
@@ -1929,7 +2456,7 @@ function EwsCard({ ews }) {
         <div className="formula">
           <p><b>Sets</b>: each working set earns {EWS.perSet} points × muscle weight × quality. Lifting muscles all weigh {MUSCLE_WEIGHT.Chest}, mobility {MUSCLE_WEIGHT["Mobility/Rehab"]}.</p>
           <p>Quality: a full set is 1.0, a drop row {EWS.dropCredit}, a light set (50 to 70% of the top load) {EWS.lightCredit}, a junk set (under 50% of the top load, or under half the target) {EWS.junkCredit}. With RPE logged: {EWS.rpe.hard}+ is 1.0, {EWS.rpe.mid} is {EWS.rpe.midCredit}, lower is {EWS.rpe.easyCredit}.</p>
-          <p><b>Cardio</b>: {EWS.cardio.perMin} point per minute × intensity × pace. Intensity is set by the machine: incline walk 0.8, steady bike 1.0, running 1.2, rower 1.25, assault bike 1.5. Pace compares your km per minute to a normal pace on that machine, from {EWS.cardio.paceMin}× to {EWS.cardio.paceMax}×; with no distance logged it counts as normal. 30 minutes of running at 10 km/h is about {Math.round(30 * EWS.cardio.perMin * 1.2)}.</p>
+          <p><b>Cardio</b>: {EWS.cardio.perMin} {EWS.cardio.perMin === 1 ? "point" : "points"} per minute × intensity × pace. Intensity is set by the machine: incline walk 0.8, steady bike 1.0, running 1.2, rower 1.25, assault bike 1.5. Pace compares your km per minute to a normal pace on that machine, from {EWS.cardio.paceMin}× to {EWS.cardio.paceMax}×; with no distance logged it counts as normal. 30 minutes of running at 10 km/h is about {Math.round(30 * EWS.cardio.perMin * 1.2)}.</p>
           <p><b>vs last time</b>: each exercise's points × {EWS.lastK} × h(change in best estimated 1RM since your last session of it), floored at {EWS.lastFloorPct}%. Cardio splits this between time and pace.</p>
           <p><b>PR bonus</b>: each exercise's points × {EWS.prK} × h(% over your previous best), once you have {EWS.prMinPrior} earlier sessions of it. Cardio PRs are longest session and fastest pace, half each.</p>
           <p>h(p) = ln(1 + p/{EWS.pctScale}). A 3% PR adds about {Math.round(EWS.prK * Math.log(1 + 3 / EWS.pctScale) * 100)}% of that exercise's points, 10% adds {Math.round(EWS.prK * Math.log(1 + 10 / EWS.pctScale) * 100)}%, 25% adds {Math.round(EWS.prK * Math.log(1 + 25 / EWS.pctScale) * 100)}%. Diminishing, never capped. Cardio time uses a flatter curve, p/{EWS.cardio.durPctScale}, because sessions swing by 30% or more.</p>
@@ -2356,7 +2883,16 @@ function VolumeTab({ sessions, exResolve }) {
    Program tab: the plan, plus the less-used tools behind it
    ============================================================ */
 function ProgramTab(props) {
-  const { program, setProgram, onAdvanceWeek, onExitMeso, restPrefs, injuries, custom } = props;
+  const { program, setProgram, onAdvanceWeek, onGoBackWeek, onExitMeso, onSetMode, restPrefs, injuries, custom } = props;
+  const advanced = program.feedbackMode === "advanced";
+  /* weekly sets per trained muscle (Advanced), in program order */
+  const volRows = useMemo(() => {
+    const m = program.meso;
+    if (!advanced || !m || !m.vol || m.type === "531") return null;
+    const seen = [];
+    program.days.forEach(d => d.items.forEach(it => { const ex = props.exByKey(it.key); if (ex && m.vol[ex.m] != null && !seen.includes(ex.m)) seen.push(ex.m); }));
+    return seen.map(mu => `${mu} ${m.vol[mu]}`).join(", ");
+  }, [program, advanced, props.exByKey]);
   const [sub, setSub] = useState(null); // null | {k:"day", id} | {k:"build"|"injuries"|"rest"|"exercises"|"backup"}
   const [confirmExit, setConfirmExit] = useState(false);
   const go = s => { setSub(s); window.scrollTo(0, 0); };
@@ -2409,11 +2945,22 @@ function ProgramTab(props) {
                 </div>
               </div>
             )}
+            {volRows && !st.isDeload && (
+              <div className="row" style={{ display: "block" }}>
+                <div className="row-title">Weekly sets</div>
+                <div className="row-sub">{volRows}</div>
+              </div>
+            )}
             <button className="row" onClick={onAdvanceWeek} disabled={finished}>
               <span className={cx("row-main row-title", finished ? "muted" : "row-action")}>
-                {finished ? "Mesocycle complete" : st.week + 1 > st.accumWeeks ? "Start deload week" : `Move to week ${st.week + 1}`}
+                {finished ? "Final week" : st.week + 1 > st.accumWeeks ? "Start deload week now" : `Start week ${st.week + 1} now`}
               </span>
             </button>
+            {st.week > 1 && (
+              <button className="row" onClick={() => onGoBackWeek()}>
+                <span className="row-main row-title row-action">Go back to week {st.week - 1}</span>
+              </button>
+            )}
             <button className="row" onClick={() => setConfirmExit(true)}>
               <span className="row-main row-title dim">End mesocycle</span>
             </button>
@@ -2421,7 +2968,7 @@ function ProgramTab(props) {
           <div className="group-foot">
             {st.type === "531"
               ? "Each week moves the percentage wave: 5s, 3s, 5/3/1, then deload. After the deload, build a new cycle with maxes up 2.5 kg for upper lifts and 5 kg for lower."
-              : "Moving to the next week adds sets and lowers the reps-in-reserve target. Weights keep progressing workout to workout."}
+              : `Weeks move on by themselves 7 days after they start. Each new week lowers the reps-in-reserve target and loads are set from your RPE against it. ${advanced ? "Sets per muscle come from your check-in answers." : "Sets rise on a fixed ramp."} Go back reopens the previous week for 7 days.`}
           </div>
         </>
       )}
@@ -2444,6 +2991,13 @@ function ProgramTab(props) {
 
       <GroupLabel>Training</GroupLabel>
       <div className="group">
+        <div className="row" style={{ display: "block", paddingTop: 12, paddingBottom: 12 }}>
+          <div className="row-title">Programming</div>
+          <div className="row-sub" style={{ marginBottom: 10 }}>{advanced
+            ? "Check-in questions during workouts set each muscle's sets for the next week"
+            : "Sets rise on a fixed weekly ramp. No questions"}</div>
+          <Seg value={advanced ? "advanced" : "standard"} onChange={onSetMode} options={[["standard", "Standard"], ["advanced", "Advanced"]]} />
+        </div>
         <div className="row">
           <span className="row-main row-title">Workouts per week</span>
           <Stepper value={program.target || 0} min={1} max={14} onChange={v => setProgram({ ...program, target: v })} />
@@ -2484,7 +3038,7 @@ function ProgramTab(props) {
   );
 }
 
-function DayEditor({ program, setProgram, exByKey, openPicker, day, onBack }) {
+function DayEditor({ program, setProgram, exByKey, openPicker, openSwap, onHowTo, convertedStart, day, onBack }) {
   const [menu, setMenu] = useState(false);
   const [itemMenu, setItemMenu] = useState(null);
   const [confirmDel, setConfirmDel] = useState(false);
@@ -2496,7 +3050,19 @@ function DayEditor({ program, setProgram, exByKey, openPicker, day, onBack }) {
   const dupDay = () => setDays(ds => ds.flatMap(d => d.id === dId ? [d, { id: uid(), name: d.name + " copy", items: d.items.map(it => ({ ...it, target: it.target ? { ...it.target } : null })) }] : [d]));
   const rmDay = () => { setDays(ds => ds.filter(d => d.id !== dId)); onBack(); };
   const addItem = exKey => setDays(ds => ds.map(d => d.id === dId ? { ...d, items: [...d.items, { key: exKey, target: T(3, 8, 12, null) }] } : d));
-  const swapItem = (i, exKey) => setDays(ds => ds.map(d => d.id === dId ? { ...d, items: d.items.map((it, j) => j === i ? { ...it, key: exKey, est: false } : it) } : d));
+  /* swap: new key, rep band for its role, tier for set allocation, and a
+     converted starting weight when the old slot had one */
+  const swapItem = (i, exKey) => setDays(ds => ds.map(d => {
+    if (d.id !== dId) return d;
+    return { ...d, items: d.items.map((it, j) => {
+      if (j !== i) return it;
+      const oldEx = exByKey(it.key), ex = exByKey(exKey);
+      if (!ex) return it;
+      const conv = convertedStart ? convertedStart(it.key, it.target && it.target.w, ex) : null;
+      const target = it.target ? { ...swapTarget(it.target, oldEx, ex), ...(conv ? { w: conv.w } : {}) } : it.target;
+      return { ...it, key: exKey, est: !!conv, ...(it.tier ? { tier: roleTier(ex.role) } : {}), target };
+    }) };
+  }));
   const rmItem = i => setDays(ds => ds.map(d => d.id === dId ? { ...d, items: d.items.filter((_, j) => j !== i) } : d));
   const moveItem = (from, to) => setDays(ds => ds.map(d => {
     if (d.id !== dId) return d; const a = [...d.items]; if (to < 0 || to >= a.length) return d;
@@ -2522,6 +3088,7 @@ function DayEditor({ program, setProgram, exByKey, openPicker, day, onBack }) {
                 <div className="ex-name">{ex ? ex.n : "Missing exercise"}</div>
                 <div className="ex-lines">{ex ? [ex.m, ex.e, rpHint(ex)].filter(Boolean).join(", ") : "Swap in a replacement"}</div>
               </div>
+              {ex && onHowTo && <button className="icon-btn" aria-label={`How to do ${ex.n}`} onClick={() => onHowTo(it.key)}><Icon n="info" /></button>}
               {day.items.length > 1 && <MoveBtns index={i} count={day.items.length} onMove={moveItem} name={ex ? ex.n : "exercise"} />}
               <button className="icon-btn" aria-label={`Options for ${ex ? ex.n : "exercise"}`} onClick={() => setItemMenu(i)}><Icon n="more" /></button>
             </div>
@@ -2547,7 +3114,9 @@ function DayEditor({ program, setProgram, exByKey, openPicker, day, onBack }) {
       {itemMenu != null && day.items[itemMenu] && (() => {
         const it = day.items[itemMenu]; const ex = exByKey(it.key);
         return <ActionSheet onClose={() => setItemMenu(null)} message={ex ? ex.n : "Missing exercise"} actions={[
-          { label: "Swap for another exercise", onClick: () => { const i = itemMenu; openPicker(k => swapItem(i, k), ex ? ex.m : ""); } },
+          ex && openSwap && { label: "Swap for a similar exercise", onClick: () => { const i = itemMenu; openSwap(it.key, k => swapItem(i, k), false); } },
+          { label: ex ? "Choose any exercise" : "Swap for another exercise", onClick: () => { const i = itemMenu; openPicker(k => swapItem(i, k), ex ? ex.m : ""); } },
+          ex && onHowTo && { label: "How to do it", onClick: () => onHowTo(it.key) },
           { label: "Remove from day", danger: true, onClick: () => rmItem(itemMenu) }
         ]} />;
       })()}
@@ -2936,6 +3505,155 @@ function CustomLibrary({ program, custom, removeCustom, updateCustom, onBack }) 
         message={`Delete ${confirmDel.n}?${usage[confirmDel.key] ? ` It's used in ${plural(usage[confirmDel.key], "program day")}; those slots will need a replacement.` : ""} Logged workouts keep the name but drop out of muscle totals.`}
         actions={[{ label: "Delete exercise", danger: true, onClick: () => removeCustom(confirmDel.key) }]} />}
     </div>
+  );
+}
+
+/* ============================================================
+   How to do an exercise: photos (start and end position, alternating),
+   muscles, steps, and a video. Your own saved link plays inside the sheet
+   when it's YouTube; otherwise a YouTube search opens.
+   ============================================================ */
+function ExercisePhotos({ id, n }) {
+  const [frame, setFrame] = useState(0);
+  const [base, setBase] = useState(0);   // which image host; falls back once
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (n < 2) return;
+    const t = setInterval(() => setFrame(f => (f + 1) % n), 1100);
+    return () => clearInterval(t);
+  }, [n]);
+  if (failed || !id) return null;
+  const src = i => `${HOWTO.IMG[base]}${id}/${i}.jpg`;
+  const onErr = () => { if (base + 1 < HOWTO.IMG.length) setBase(base + 1); else setFailed(true); };
+  return (
+    <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: "#fff", aspectRatio: "4 / 3", marginTop: 4 }}>
+      {Array.from({ length: Math.max(1, n) }, (_, i) => (
+        <img key={base + ":" + i} src={src(i)} alt={i === 0 ? "Start position" : "End position"} onError={onErr} loading="lazy"
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", opacity: frame === i ? 1 : 0, transition: "opacity .35s" }} />
+      ))}
+      {n > 1 && <div style={{ position: "absolute", left: 8, bottom: 8, fontSize: 12, fontWeight: 600, color: "#fff", background: "rgba(0,0,0,.55)", borderRadius: 6, padding: "3px 7px" }}>{frame === 0 ? "Start" : "Finish"}</div>}
+    </div>
+  );
+}
+function HowToSheet({ ex, video, onSaveVideo, onClose }) {
+  const [editing, setEditing] = useState(false);
+  const [url, setUrl] = useState(video || "");
+  const [play, setPlay] = useState(false);
+  if (!ex) return null;
+  const m = howMeta(ex);
+  const yt = youTubeId(video);
+  const muscles = [ex.m, ...(m.s || []).filter(x => x !== ex.m)];
+  const sub = [ex.e, HOWTO.PATTERN[m.p], m.st ? "stretch-focused" : null].filter(Boolean).join(", ");
+  const save = () => { const u = url.trim(); onSaveVideo(u ? (/^https?:\/\//i.test(u) ? u : "https://" + u) : null); setEditing(false); };
+  return (
+    <Sheet title={ex.n} onClose={onClose}>
+      {sub && <div className="muted small" style={{ marginBottom: 8 }}>{sub}</div>}
+      {video && yt && play ? (
+        <div style={{ position: "relative", aspectRatio: "16 / 9", borderRadius: 12, overflow: "hidden", background: "#000" }}>
+          <iframe src={`https://www.youtube-nocookie.com/embed/${yt}?autoplay=1&playsinline=1&rel=0`} title={`${ex.n} video`}
+            allow="autoplay; encrypted-media; picture-in-picture" allowFullScreen style={{ position: "absolute", inset: 0, width: "100%", height: "100%", border: 0 }} />
+        </div>
+      ) : (
+        <ExercisePhotos id={m.id} n={m.imgs || 0} />
+      )}
+
+      <div className="btn-row" style={{ marginTop: 12 }}>
+        {video ? (
+          yt ? <button className="btn btn-primary" onClick={() => setPlay(p => !p)}><Icon n="play" s={18} w={2.2} />{play ? "Show photos" : "Play video"}</button>
+             : <a className="btn btn-primary" href={video} target="_blank" rel="noopener noreferrer"><Icon n="play" s={18} w={2.2} />Open video</a>
+        ) : (
+          <a className="btn btn-primary" href={ytSearch(ex.n)} target="_blank" rel="noopener noreferrer"><Icon n="play" s={18} w={2.2} />Find a video</a>
+        )}
+      </div>
+
+      <div className="group-label" style={{ marginTop: 20 }}>Muscles</div>
+      <div className="dim" style={{ fontSize: 15 }}><b style={{ color: C.ink, fontWeight: 600 }}>{muscles[0]}</b>{muscles.length > 1 ? `, also ${muscles.slice(1).join(", ").toLowerCase()}` : ""}</div>
+
+      {m.how && m.how.length > 0 && (
+        <>
+          <div className="group-label">How to do it</div>
+          <ol style={{ margin: 0, paddingLeft: 20, fontSize: 15, lineHeight: 1.5, color: C.ink2 }}>
+            {m.how.map((t, i) => <li key={i} style={{ marginBottom: 8 }}>{t}</li>)}
+          </ol>
+        </>
+      )}
+
+      <div className="group-label">Your video</div>
+      {editing ? (
+        <div style={{ display: "flex", gap: 8 }}>
+          <input className="field" type="url" inputMode="url" autoFocus value={url} placeholder="Paste a YouTube or other link" onChange={e => setUrl(e.target.value)} onKeyDown={e => e.key === "Enter" && save()} />
+          <button className="btn btn-primary btn-sm" style={{ minHeight: 44 }} onClick={save}>Save</button>
+        </div>
+      ) : (
+        <div className="group" style={{ background: C.surface2 }}>
+          <button className="row" onClick={() => { setUrl(video || ""); setEditing(true); }}>
+            <div className="row-main">
+              <div className="row-title row-action">{video ? "Change video link" : "Save a video link"}</div>
+              <div className="row-sub" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{video || "Pick a good one once and it shows here for everyone using this phone"}</div>
+            </div>
+          </button>
+          {video && <button className="row" onClick={() => { onSaveVideo(null); setPlay(false); }}><span className="row-main row-title bad">Remove video link</span></button>}
+          {video && <a className="row" href={ytSearch(ex.n)} target="_blank" rel="noopener noreferrer"><span className="row-main row-title row-action">Search YouTube instead</span></a>}
+        </div>
+      )}
+      {m.id && <div className="muted small" style={{ marginTop: 14 }}>Photos and steps: free-exercise-db (public domain).</div>}
+    </Sheet>
+  );
+}
+
+/* ============================================================
+   Swap for a similar exercise
+   ============================================================ */
+function SwapSheet({ from, allEx, lastForExercise, scopes, onPick, onHowTo, onBrowse, onClose }) {
+  const [equip, setEquip] = useState("All");
+  const [scope, setScope] = useState("today");
+  const ranked = useMemo(() => similarExercises(from, allEx), [from, allEx]);
+  if (!from) return null;
+  const equipList = ["All", ...["Barbell", "Dumbbell", "Machine", "Cable", "Bodyweight", "Band"].filter(e => ranked.some(r => r.ex.e === e))];
+  const shown = ranked.filter(r => equip === "All" || r.ex.e === equip);
+  const same = shown.filter(r => r.samePat), other = shown.filter(r => !r.samePat).slice(0, 10);
+  const fromPat = HOWTO.PATTERN[howMeta(from).p];
+  const row = r => {
+    const last = lastForExercise(r.ex.key);
+    const meta = [r.ex.e, !r.samePat && HOWTO.PATTERN[r.pat], howMeta(r.ex).st && "stretch-focused"].filter(Boolean).join(", ");
+    return (
+      <div key={r.ex.key} className="row" style={{ paddingRight: 4 }}>
+        <button className="row-main" style={{ textAlign: "left", minHeight: 44 }} onClick={() => onPick(r.ex.key, scope)}>
+          <div className="row-title">{r.ex.n}{r.ex.key.startsWith("cus:") && <span className="tag est" style={{ marginLeft: 8 }}>Yours</span>}</div>
+          <div className="row-sub">{meta}{last ? `. Last ${prevSummary(r.ex.t, last.slice(0, 1), r.ex.key)}` : ""}</div>
+        </button>
+        <button className="icon-btn" aria-label={`How to do ${r.ex.n}`} onClick={() => onHowTo(r.ex.key)}><Icon n="info" /></button>
+      </div>
+    );
+  };
+  return (
+    <Sheet title={`Swap ${from.n}`} onClose={onClose} bodyStyle={{ paddingTop: 0 }}
+      foot={<button className="btn btn-secondary block" onClick={onBrowse}><Icon n="search" s={18} />Choose from all exercises</button>}>
+      {scopes && (
+        <>
+          <Seg value={scope} onChange={setScope} options={[["today", "Just today"], ["program", "Rest of program"]]} style={{ marginTop: 4 }} />
+          <div className="muted small" style={{ margin: "6px 2px 0" }}>{scope === "today" ? "Your program stays as it is." : "Replaces it in this workout day from now on."}</div>
+        </>
+      )}
+      {equipList.length > 2 && (
+        <div className="chips" style={{ marginTop: 12 }}>
+          {equipList.map(e => <button key={e} className={cx("chip", equip === e && "on")} onClick={() => setEquip(e)}>{e}</button>)}
+        </div>
+      )}
+      {same.length > 0 && (
+        <>
+          <div className="group-label" style={{ marginTop: 16 }}>Same movement{fromPat ? `: ${fromPat.toLowerCase()}` : ""}</div>
+          <div className="group" style={{ background: C.surface2 }}>{same.map(row)}</div>
+        </>
+      )}
+      {other.length > 0 && (
+        <>
+          <div className="group-label" style={{ marginTop: 16 }}>Also trains {from.m.toLowerCase()}</div>
+          <div className="group" style={{ background: C.surface2 }}>{other.map(row)}</div>
+        </>
+      )}
+      {same.length === 0 && other.length === 0 && <Empty msg="No close matches with this equipment. Choose from all exercises below." />}
+    </Sheet>
   );
 }
 

@@ -339,6 +339,113 @@
     return { topW, plan, bumped, reason };
   }
 
+  /* ==========================================================
+     RIR ENGINE (hypertrophy mesocycles), Oct 2026
+     Replaces "+1 rep" with load and reps solved from effort.
+     Each logged set gives an effort-adjusted e1RM (Epley with reps in reserve):
+       e1 = w × (1 + (reps + RIR) / 30)
+     RIR = 10 − RPE when RPE was logged, else the RIR target that session was
+     prescribed (opts.rirFallback, default 2).
+     This week's RIR target then sets reps for a given load:
+       repsAt(w) = round(30 × (e1 / w − 1) − RIRtarget)
+     Choice, in order:
+       up      next load increment still gives at least last reps − 1 (and the
+               bottom of the band), or holding would overshoot the band top
+       hold    same load, reps solved (RIR 3 -> 2 at 10 reps is about +1 rep)
+       capped  over the band top but the next jump is too big (small dumbbells)
+       down    same load can't reach the bottom of the band: step load down
+     Later sets keep last session's fatigue: if set 3 fell to 90% of set 1's
+     e1 last time, it is planned at 90% again.
+     ========================================================== */
+  function rpeToRir(rpe) {
+    if (rpe === "" || rpe == null) return null;
+    const n = Number(rpe);
+    if (!isFinite(n) || n <= 0) return null;
+    return Math.max(0, Math.min(5, 10 - n));
+  }
+  const repsAt = (e1, w, rir) => w > 0 ? Math.round(30 * (e1 / w - 1) - rir) : 0;
+
+  /* prevSets  last session's working sets [{w,r,rpe}], best set first
+     ex        library row
+     band      {repLo, repHi}
+     opts      { rirTarget, rirFallback, deload, nSets, workDown }
+     Returns { topW, plan:[{w,r}], bumped, kind, reason, e1 } or null. */
+  function suggestRIR(prevSets, ex, band, opts) {
+    opts = opts || {};
+    const repLo = (band && band.repLo) || (ex && ex.rp ? ex.rp[0] : 8);
+    const repHi = (band && band.repHi) || (ex && ex.rp ? ex.rp[1] : 12);
+    const t = opts.rirTarget != null ? opts.rirTarget : 2;
+    const fb = opts.rirFallback != null ? opts.rirFallback : 2;
+    const rows = (prevSets || []).filter(s => (Number(s.w) || 0) > 0 && (Number(s.r) || 0) > 0).map(s => {
+      const lg = rpeToRir(s.rpe);
+      const rir = lg == null ? fb : lg;
+      const w = Number(s.w), r = Number(s.r);
+      return { w, r, rir, rpe: lg == null ? null : Number(s.rpe), e1: w * (1 + (r + rir) / 30) };
+    });
+    if (!rows.length) return null;
+    const nSets = Math.max(1, opts.nSets || rows.length);
+    const equip = ex ? ex.e : "Barbell";
+    const maxW = Math.max(...rows.map(s => s.w));
+    const top = rows.filter(s => s.w >= maxW * 0.999);
+    const top0 = top[0];
+    const e1 = Math.max(...top.map(s => s.e1));
+    const lastR = top0.r;
+
+    if (opts.deload) {
+      const w = roundLoad(maxW * 0.9) || maxW;
+      return { topW: w, plan: Array.from({ length: nSets }, () => ({ w, r: repLo })), bumped: false, kind: "deload", e1,
+               reason: "Deload week: 10% lighter, bottom of the rep range, stop well short of failure" };
+    }
+
+    const inc = incFor(equip, maxW);
+    const wUp = roundLoad(maxW + inc) || (maxW + inc);
+    const rHold = repsAt(e1, maxW, t);
+    const rUp = repsAt(e1, wUp, t);
+    let w, r, kind;
+    if (rUp >= repLo && (rUp >= lastR - 1 || rHold > repHi)) {
+      w = wUp; r = Math.min(rUp, repHi); kind = "up";
+      // still past the band top after one jump: allow a second
+      const w2 = roundLoad(wUp + incFor(equip, wUp)) || (wUp + inc);
+      const r2 = repsAt(e1, w2, t);
+      if (rUp > repHi && r2 >= Math.max(repLo, lastR - 1)) { w = w2; r = Math.min(r2, repHi); }
+    } else if (rHold >= repLo) {
+      w = maxW; r = Math.min(rHold, repHi);
+      kind = rHold > repHi ? "capped" : r > lastR ? "reps" : r === lastR ? "hold" : "fewer";
+    } else {
+      w = maxW;
+      for (let k = 0; k < 8 && repsAt(e1, w, t) < repLo && w > inc; k++) w = roundLoad(w - incFor(equip, w)) || (w - inc);
+      r = Math.max(repLo, Math.min(repHi, repsAt(e1, w, t)));
+      kind = "down";
+    }
+
+    const drop = opts.workDown === false ? 0
+               : (ex && ex.role === "heavy") ? 0.10
+               : (ex && ex.role === "compound") ? 0.05 : 0;
+    const backW = drop > 0 ? (roundLoad(w * (1 - drop)) || w) : w;
+    const plan = [];
+    for (let i = 0; i < nSets; i++) {
+      const wi = (i === 0 || drop === 0) ? w : backW;
+      if (i === 0) { plan.push({ w: wi, r }); continue; }
+      const src = rows[Math.min(i, rows.length - 1)];
+      const fat = Math.min(1, src.e1 / e1);
+      let ri = Math.max(repLo, Math.min(repHi, repsAt(e1 * fat, wi, t)));
+      if (wi === w) ri = Math.min(ri, r);
+      plan.push({ w: wi, r: ri });
+    }
+
+    const lastTxt = `${maxW} × ${lastR}${top0.rpe != null ? ` at RPE ${top0.rpe}` : ""}`;
+    const tgt = `${t} RIR`;
+    const reason = {
+      up:     `Up to ${w} kg for ${r}. Last time ${lastTxt}, this week ${tgt}`,
+      reps:   `Stay at ${w} kg, ${r} reps at ${tgt}. Last time ${lastTxt}`,
+      hold:   `Repeat ${w} kg × ${r} at ${tgt}. Last time ${lastTxt}`,
+      fewer:  `${w} kg × ${r} at ${tgt}. Last time ${lastTxt} was harder than planned`,
+      capped: `Top of the range at ${w} kg and the next jump is too big. Hold ${repHi} reps at ${tgt}`,
+      down:   `Down to ${w} kg × ${r} at ${tgt}. Last time ${lastTxt} was too close to failure`
+    }[kind];
+    return { topW: w, plan, bumped: kind === "up", kind, reason, e1 };
+  }
+
   /* --- Accessory seeding model.
      Each library exercise that needs a guessed weight is mapped to ONE of:
        {from:"BENCH"|"SQUAT"|"DEAD", k:fraction}   -> fraction of that lift's est working weight
@@ -435,6 +542,22 @@
     "Cross-Body Extension": {bw:0.15}, "Single-Arm Pushdown": {bw:0.20}, "Machine Dip": {bw:0.8},
     "Machine Crunch": {bw:0.5}, "Suitcase Carry": {bwHand:0.4}
   };
+
+  /* Starting load when swapping one exercise for another, from the seed
+     ratios above: both tied to the same lift (bench, squat, deadlift), or
+     both a fraction of bodyweight. w is the old exercise's top working
+     weight. Returns null when the two can't be compared (different lifts,
+     or one of them has no seed). Deliberately rough: the first session on
+     the new exercise is marked Estimated and recalibrates from there. */
+  function convertLoad(fromName, toName, w) {
+    const a = SEED[fromName], b = SEED[toName];
+    if (!a || !b || !(w > 0)) return null;
+    let r = null;
+    if (a.lift && b.lift && a.lift === b.lift) r = b.k / a.k;
+    const fa = a.bw != null ? a.bw : a.bwHand, fb = b.bw != null ? b.bw : b.bwHand;
+    if (r == null && fa != null && fb != null && fa > 0) r = fb / fa;
+    return r == null ? null : roundLoad(w * r);
+  }
 
   /* Given the user's stats {bench,squat,dead,bodyweight} (working est-1RMs or
      working weights — we treat them as est-1RM proxies), return a seeded
@@ -725,6 +848,9 @@
       }).filter(Boolean);
       return { id: uidLocal(), name: bp.name, blueprint: dayId, items };
     });
+    // exact weekly totals per muscle (the per-day estimate above is replaced)
+    const allocated = allocateSets(days, weeklySets, false);
+    days.splice(0, days.length, ...allocated);
 
     const cardio = cardioBlock(opts.goal);
     const rir = rirTarget(week, accumWeeks, goal.rirOffset);
@@ -848,10 +974,108 @@
     return { ...program, days, meso:{ ...m, week, isDeload, waveLabel: wave.label } };
   }
 
-  /* Advance an existing generated program to a target week: recompute set
-     counts (ramp) and RIR band; keep user-logged/edited weights intact.
-     We DON'T overwrite weights here — load progression is handled per-session
-     by app.js (effectiveTargetW). We only move SETS and RIR. */
+  /* ==========================================================
+     SET ALLOCATION
+     A muscle's weekly set total is split over every exercise that trains it,
+     across all days, so the week actually adds up to the target and a +1
+     week shows up as one more set somewhere. Remainder sets go to heavy
+     compounds first, then compounds, then isolations. Per exercise: at least
+     3 for heavy compounds and 2 otherwise (1 on a deload), at most 6.
+     Custom exercises have no library muscle and keep their own set count.
+     ========================================================== */
+  const TIER_RANK = { pri: 0, sec: 1, iso: 2 };
+  function allocateSets(days, weeklySets, isDeload) {
+    const slots = {};
+    days.forEach((d, di) => d.items.forEach((it, ii) => {
+      const lib = LIB_BY_NAME.get((it.key || "").replace(/^lib:/, ""));
+      const mu = lib && lib.m;
+      if (!mu || weeklySets[mu] == null) return;
+      (slots[mu] = slots[mu] || []).push({ di, ii, rank: TIER_RANK[it.tier] != null ? TIER_RANK[it.tier] : 1 });
+    }));
+    const out = days.map(d => ({ ...d, items: d.items.map(it => ({ ...it, target: { ...(it.target || {}) } })) }));
+    Object.keys(slots).forEach(mu => {
+      const list = slots[mu].map((x, k) => ({ ...x, k }));
+      const W = Math.max(0, Math.round(weeklySets[mu]));
+      const base = Math.floor(W / list.length);
+      let rem = W - base * list.length;
+      list.sort((a, b) => a.rank - b.rank || a.k - b.k).forEach(x => {
+        let sets = base + (rem > 0 ? 1 : 0); if (rem > 0) rem--;
+        const floor = isDeload ? 1 : x.rank === 0 ? 3 : 2;
+        out[x.di].items[x.ii].target.sets = Math.max(floor, Math.min(6, sets));
+      });
+    });
+    return out;
+  }
+
+  /* weekly sets per muscle from the fixed ramp (Standard mode, and the
+     starting point for Advanced) */
+  function weekVolume(meso, week) {
+    const goal = GOALS[meso.goal] || GOALS.gain;
+    const out = {};
+    RAMP_MUSCLES.forEach(mu => { out[mu] = rampSets(mu, week, meso.accumWeeks, goal.volMult); });
+    return out;
+  }
+
+  /* ==========================================================
+     ADVANCED MODE: weekly sets from check-in answers (RP style)
+     Answers per muscle per session:
+       soreness  before training it again: early | ontime | sore
+       pump      after its last set:       low | ok | great
+       workload  after its last set:       easy | good | limit
+       joint     after its last set:       none | some | lots
+     Each answered session gives a change:
+       two warning signs (still sore, at limit, lots of joint pain)  -1 set
+       one warning sign                                               hold
+       otherwise +1, or +2 with two of: healed early, easy, low pump
+       "some" joint pain takes 1 off a positive change
+     The muscle's change for the week is the average, rounded (+2, +1, 0, -1).
+     -1 marks the muscle as at its ceiling. A muscle with no answers follows
+     the fixed ramp. Weekly sets stay between the muscle's MV and MRV.
+     ========================================================== */
+  function fbChange(r) {
+    const bad = (r.soreness === "sore") + (r.workload === "limit") + (r.joint === "lots");
+    if (bad >= 2) return { d: -1, why: [r.soreness === "sore" && "still sore", r.workload === "limit" && "at limit", r.joint === "lots" && "joint pain"].filter(Boolean).join(", ") };
+    if (bad === 1) return { d: 0, why: r.soreness === "sore" ? "still sore" : r.workload === "limit" ? "workload at limit" : "joint pain" };
+    const good = (r.soreness === "early") + (r.workload === "easy") + (r.pump === "low");
+    let d = good >= 2 ? 2 : 1;
+    if (r.joint === "some") d = Math.max(0, d - 1);
+    return { d, why: r.joint === "some" ? "some joint pain" : good >= 2 ? "recovering fast" : "recovering on time" };
+  }
+  const fbAnswered = r => r && ["soreness", "pump", "workload", "joint"].some(k => r[k] != null);
+  /* vol: this week's weekly sets per muscle. fb: { muscle: [answers...] }
+     Returns { vol, notes:[{muscle, from, to, why}], ceilings:[muscle] } */
+  function adjustVolume(meso, vol, fromWeek, toWeek, fb) {
+    const goal = GOALS[meso.goal] || GOALS.gain;
+    const out = { ...vol }, notes = [], ceilings = [];
+    RAMP_MUSCLES.forEach(mu => {
+      const lm = LANDMARKS[mu];
+      const cur = vol[mu] != null ? vol[mu] : rampSets(mu, fromWeek, meso.accumWeeks, goal.volMult);
+      const recs = (fb[mu] || []).filter(fbAnswered);
+      let d, why;
+      if (!recs.length) {
+        d = Math.max(0, rampSets(mu, toWeek, meso.accumWeeks, goal.volMult) - rampSets(mu, fromWeek, meso.accumWeeks, goal.volMult));
+        why = null;
+      } else {
+        const ch = recs.map(fbChange);
+        const avg = ch.reduce((a, c) => a + c.d, 0) / ch.length;
+        d = avg >= 1.5 ? 2 : avg >= 0.5 ? 1 : avg > -0.5 ? 0 : -1;
+        const worst = ch.slice().sort((a, b) => a.d - b.d)[0];
+        why = worst.why;
+        if (d < 0) ceilings.push(mu);
+      }
+      const next = Math.max(Math.max(lm[0], 2), Math.min(lm[3], cur + d));
+      if (next === cur && d > 0) why = (why ? why + ", " : "") + "already at the most you can recover from";
+      out[mu] = next;
+      if (recs.length) notes.push({ muscle: mu, from: cur, to: next, why });
+    });
+    return { vol: out, notes, ceilings };
+  }
+
+  /* Advance an existing generated program to a target week: set counts and
+     the RIR band. Weights are left alone; load comes per session from
+     suggestRIR in app.js. In Advanced mode meso.vol holds this week's weekly
+     sets per muscle (set from check-ins); otherwise the fixed ramp applies.
+     The deload always uses the ramp's deload volume. */
   function applyWeek(program, newWeek) {
     if (!program || !program.meso) return program;
     if (program.meso.type === "531") return applyWeek531(program, newWeek);
@@ -859,39 +1083,13 @@
     const accumWeeks = m.accumWeeks;
     const goal = GOALS[m.goal] || GOALS.gain;
     const week = Math.max(1, Math.min(newWeek, m.totalWeeks));
-
-    // recompute weekly sets per muscle for this week
-    const weeklySets = {};
-    RAMP_MUSCLES.forEach(mu => { weeklySets[mu] = rampSets(mu, week, accumWeeks, goal.volMult); });
-
-    // frequency per muscle
-    const freq = {};
-    program.days.forEach(d => {
-      const bp = DAY[d.blueprint];
-      if (bp) bp.muscles.forEach(mu => { freq[mu] = (freq[mu]||0)+1; });
-    });
-
-    const days = program.days.map(d => {
-      const bp = DAY[d.blueprint];
-      const items = d.items.map(it => {
-        const lib = LIB_BY_NAME.get((it.key||"").replace(/^lib:/, "")) || null;
-        const muscle = lib ? lib.m : null;
-        if (!muscle || weeklySets[muscle] == null || !bp) return it;
-        const exForMuscleToday = bp.ex.filter(e => {
-          const l = LIB_BY_NAME.get(e.name); return l && l.m === muscle;
-        }).length || 1;
-        const perDay = weeklySets[muscle] / (freq[muscle] || 1);
-        let sets = Math.round(perDay / exForMuscleToday);
-        const tier = it.tier || "sec";
-        const floor = tier === "pri" ? 3 : tier === "sec" ? 3 : 2;
-        sets = Math.max(floor, Math.min(sets, 5));
-        return { ...it, target: { ...it.target, sets } };
-      });
-      return { ...d, items };
-    });
-
-    const rir = rirTarget(week, accumWeeks, goal.rirOffset);
     const isDeload = week > accumWeeks;
+    const weeklySets = {};
+    RAMP_MUSCLES.forEach(mu => {
+      weeklySets[mu] = (!isDeload && m.vol && m.vol[mu] != null) ? m.vol[mu] : rampSets(mu, week, accumWeeks, goal.volMult);
+    });
+    const days = allocateSets(program.days, weeklySets, isDeload);
+    const rir = rirTarget(week, accumWeeks, goal.rirOffset);
     return { ...program, days, meso: { ...m, week, rir, isDeload } };
   }
 
@@ -1022,10 +1220,10 @@
          paceFactor = (pace / refPace)^paceExp, clamped to [paceMin, paceMax];
                       1.0 when no distance is logged or the machine has no
                       meaningful distance (stairs, rope)
-       At 1 point per minute a 30 min run at 10 km/h is ~36, about 7 lifting
-       sets. Progress is split evenly between duration and pace (pace only when
+       At 0.625 points per minute (cut from 1.0, Oct 2026) a 30 min run at
+       10 km/h is ~22, about 4.5 lifting sets. Progress is split evenly between duration and pace (pace only when
        km and minutes are both logged now and last time). */
-    cardio: { perMin: 1.0, paceExp: 0.7, paceMin: 0.6, paceMax: 1.5,
+    cardio: { perMin: 0.625, paceExp: 0.7, paceMin: 0.6, paceMax: 1.5,
               durPctScale: 15 }  // duration swings are big (30 -> 40 min is +33%), so
                                  // its progress curve is flatter than the lift/pace one
   };
@@ -1146,10 +1344,10 @@
     MUSCLE_WEIGHT, EWS, CARDIO, cardioProfile, cardioTotals, cardioScore,
     // mesocycle engine
     LANDMARKS, GOALS, SPLITS,
-    splitsForDays, generateProgram, applyWeek, mesoStatus,
-    rampSets, rirTarget, seedWeight, est1RM, roundLoad,
+    splitsForDays, generateProgram, applyWeek, mesoStatus, allocateSets, weekVolume, adjustVolume,
+    rampSets, rirTarget, seedWeight, convertLoad, est1RM, roundLoad,
     // progression + strength engine
-    suggestNext, incFor, generate531, WAVE_531,
+    suggestNext, suggestRIR, rpeToRir, incFor, generate531, WAVE_531,
     // volume landmark banding
     volumeBand
   };
