@@ -282,6 +282,23 @@
   .tag.pr{background:var(--accent-soft);color:var(--accent);}
   .tag.est{background:var(--surface-3);color:var(--ink-2);font-weight:600;}
 
+  /* ---------- feed ---------- */
+  .avatar{width:40px;height:40px;border-radius:50%;background:var(--surface-3);color:var(--ink);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;flex-shrink:0;}
+  .avatar.you{background:var(--accent-soft);color:var(--accent);}
+  .feed-card{display:block;width:100%;text-align:left;background:var(--surface);border-radius:var(--r);padding:14px 16px;transition:background .12s;}
+  .feed-card + .feed-card{margin-top:10px;}
+  .feed-card:active{background:var(--surface-2);}
+  .feed-head{display:flex;align-items:center;gap:12px;}
+  .feed-name{font-size:15.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .feed-when{font-size:13px;color:var(--ink-3);margin-top:1px;}
+  .feed-title{font-size:18px;font-weight:650;letter-spacing:-.2px;margin-top:12px;}
+  .feed-meta{font-size:14px;color:var(--ink-3);margin-top:3px;}
+  .feed-ex{margin-top:10px;padding-top:8px;border-top:1px solid var(--line);}
+  .feed-ex-row{display:flex;justify-content:space-between;gap:12px;font-size:14.5px;padding:3px 0;}
+  .feed-ex-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .feed-ex-val{color:var(--ink-2);white-space:nowrap;}
+  .feed-more{font-size:13px;color:var(--ink-3);padding-top:4px;}
+
   /* plate calc */
   .bar-viz{height:132px;display:flex;align-items:center;justify-content:flex-start;margin:6px 0 12px;position:relative;}
   .bar-viz .shaft{position:absolute;left:0;right:0;top:50%;height:10px;margin-top:-5px;background:linear-gradient(#9A9BA1,#6E6F75);border-radius:2px;}
@@ -299,13 +316,17 @@
 <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+<!-- Supabase client for accounts and the shared feed. If it fails to load
+     (offline), the app still works; the feed just isn't available. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 
 <!-- app data + storage (plain JS, run immediately) -->
 <script src="./data.js"></script>
 <script src="./storage.js"></script>
 <script src="./howto.js"></script>
 
-<!-- main app (JSX, compiled by Babel via type="text/babel") -->
+<!-- accounts + feed, then the main app (JSX, compiled by Babel via type="text/babel") -->
+<script type="text/babel" data-presets="react" src="./social.js"></script>
 <script type="text/babel" data-presets="react" src="./app.js"></script>
 
 <script>
