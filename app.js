@@ -1,6 +1,6 @@
 /* ============================================================
    app.js — Load/Log gym tracker (JSX, compiled in-browser by Babel)
-   Depends on: window.GymData, window.GymStore
+   Depends on: window.GymData, window.GymStore, window.GymSocial (optional)
    ============================================================ */
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 const { MUSCLES, LIB, T, rpHint, defaultProgram,
@@ -10,6 +10,9 @@ const { MUSCLES, LIB, T, rpHint, defaultProgram,
 const { sGet, sSet, sDel, available } = window.GymStore;
 const HOWTO = window.GymHowTo || { DATA: {}, PATTERN: {}, IMG: [] };
 const howMeta = ex => (ex && HOWTO.DATA[ex.n]) || {};
+/* accounts + shared feed (social.js). Missing or unconfigured = no social UI. */
+const SOCIAL = window.GymSocial || null;
+const NO_SOCIAL = { enabled: false, ready: true, user: null, profile: null, profileLoaded: false, inFeed: false, posted: new Set() };
 
 /* ---------- theme (mirrors the CSS custom properties in index.html; used
    where a colour has to be passed into SVG or computed inline) ---------- */
@@ -184,6 +187,28 @@ function bestE1rmBefore(sessions, key, excludeId) {
     if (e && e.t === "rep") { const bw = bwForSession(sessions, sessions.indexOf(s)); e.sets.forEach(x => { const v = repE1rm(x, bw, key); if (v > best) best = v; }); }
   });
   return best;
+}
+/* The copy of a workout that goes to the feed. Exercises, sets, duration,
+   gym, totals and PRs (vs your history before that date). Bodyweight,
+   readiness, injuries, notes and check-ins stay on the phone. */
+function feedPayload(session, sessions) {
+  const others = sessions.filter(s => s.id !== session.id);
+  const all = [...others, session];
+  const bw = session.bodyweight || bwForSession(all, all.length - 1);
+  const before = others.filter(s => s.date <= session.date);
+  let prs = 0;
+  const entries = session.entries.filter(e => e.sets && e.sets.length).map(e => {
+    let best = 0;
+    if (e.t === "wr") best = Math.max(0, ...e.sets.map(s => setE1rm(e.key, "wr", s, isBwLoaded(e.key) ? bw : null)));
+    else if (e.t === "rep" && bw) best = Math.max(0, ...e.sets.map(s => repE1rm(s, bw, e.key)));
+    let pr = false;
+    if (best) { const prior = bestE1rmBefore(before, e.key, session.id); if (prior > 0 && best > prior) { pr = true; prs++; } }
+    return { key: e.key, name: e.name, t: e.t, ...(e.group ? { group: e.group } : {}), ...(pr ? { pr: true } : {}), sets: e.sets };
+  });
+  const sets = entries.reduce((a, e) => a + workSets(e.sets).length, 0);
+  const volume = Math.round(entries.reduce((a, e) => a + e.sets.reduce((b, x) => b + (x.w || 0) * (x.r || 0), 0), 0));
+  return { v: 1, title: session.dayName || "Workout", date: session.date, durationMin: session.durationMin ?? null,
+    gym: session.gym || null, sets, volume, prs, entries };
 }
 function blankSet(t) {
   const b = { wr:{w:"",r:"",rpe:""}, rep:{r:"",add:"",rpe:""}, time:{sec:""}, wd:{w:"",dist:""}, cardio:{min:"",dist:""} }[t];
@@ -488,6 +513,11 @@ function App() {
   const [howTo, setHowTo] = useState(null);      // exercise key whose how-to sheet is open
   const [swap, setSwap] = useState(null);        // { fromKey, onPick(key, scope), scopes }
   const lastGym = useRef(null);                   // most recently used gym
+  /* accounts + feed */
+  const social = SOCIAL ? SOCIAL.useSocial() : NO_SOCIAL;
+  const [account, setAccount] = useState(false);     // account sheet open
+  const [postPrompt, setPostPrompt] = useState(null); // workout just finished, offered to the feed
+  const [histView, setHistView] = useState("mine");  // History: mine | friends
 
   const toastTimer = useRef(null);
   const flash = useCallback(m => { setToast(m); clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(""), m.length > 40 ? 3600 : 2400); }, []);
@@ -897,8 +927,18 @@ function App() {
       .sort((a, b) => a.date < b.date ? 1 : -1)[0] : null;
     let ewsMsg = ` EWS ${fmtEws(ews.total)}`;
     if (prevSame) { const d = ews.total - scoreSession(prevSame, next, exByKey, program ? program.days : null).total; ewsMsg += `, ${d >= 0 ? "up" : "down"} ${fmtEws(Math.abs(d))} on last time`; }
-    flash((existingIdx >= 0 ? "Workout updated." : "Workout saved.") + (prCount ? ` ${prCount} PR${prCount > 1 ? "s" : ""}.` : "") + ewsMsg + ".");
-  }, [draft, sessions, gyms, flash, exByKey, program]);
+    const savedMsg = (existingIdx >= 0 ? "Workout updated." : "Workout saved.") + (prCount ? ` ${prCount} PR${prCount > 1 ? "s" : ""}.` : "") + ewsMsg + ".";
+    /* feed: a new workout is offered for posting (the save summary goes in
+       the prompt, since a toast would cover its buttons); an edited one that
+       is already posted updates its post */
+    const canPost = social.inFeed && clean.entries.some(e => e.sets.length);
+    if (canPost && existingIdx < 0) { setToast(""); setPostPrompt({ session: clean, msg: savedMsg }); return; }
+    flash(savedMsg);
+    if (canPost && social.posted.has(clean.id)) {
+      social.publish(clean.id, feedPayload(clean, next))
+        .catch(() => flash("Saved here, but the feed copy didn't update. Post it again from History."));
+    }
+  }, [draft, sessions, gyms, flash, exByKey, program, social]);
 
   const discardDraft = useCallback(async () => {
     await sDel("draft:current");
@@ -910,8 +950,20 @@ function App() {
     setSessions(next);
     await sDel(`session:${id}`);
     await sSet("sessions:index", next.map(s => s.id));
+    // a deleted workout leaves the feed too
+    if (social.posted.has(id)) social.unpublish(id).catch(() => {});
     setViewSession(null); flash("Workout deleted.");
-  }, [sessions, flash]);
+  }, [sessions, flash, social]);
+
+  /* ---- feed ---- */
+  const postSession = useCallback(async session => {
+    try { await social.publish(session.id, feedPayload(session, sessions)); flash("Posted to the feed."); }
+    catch (e) { flash((e && e.message) || "Couldn't post. Try again from History."); }
+  }, [social, sessions, flash]);
+  const unpostSession = useCallback(async id => {
+    try { await social.unpublish(id); flash("Removed from the feed."); }
+    catch (e) { flash((e && e.message) || "Couldn't remove it. Try again."); }
+  }, [social, flash]);
 
   // hydrate a saved session back into editable draft shape (values -> strings)
   const editSession = useCallback(session => {
@@ -1144,8 +1196,10 @@ function App() {
         )}
         {tab === "history" && (
           viewSession
-            ? <SessionDetail session={viewSession} onBack={() => { setViewSession(null); window.scrollTo(0, 0); }} onDelete={deleteSession} onEdit={editSession} exByKey={exByKey} scoreOf={scoreOf} />
-            : <HistoryList sessions={sessions} onOpen={s => { setViewSession(s); window.scrollTo(0, 0); }} scoreOf={scoreOf} onStart={() => goTab("log")} />
+            ? <SessionDetail session={viewSession} onBack={() => { setViewSession(null); window.scrollTo(0, 0); }} onDelete={deleteSession} onEdit={editSession} exByKey={exByKey} scoreOf={scoreOf}
+                social={social} onPost={postSession} onUnpost={unpostSession} onAccount={() => setAccount(true)} />
+            : <HistoryList sessions={sessions} onOpen={s => { setViewSession(s); window.scrollTo(0, 0); }} scoreOf={scoreOf} onStart={() => goTab("log")}
+                social={social} view={histView} setView={setHistView} onAccount={() => setAccount(true)} flash={flash} />
         )}
         {tab === "trends" && <Trends sessions={sessions} allEx={allEx} exResolve={exByKey} scoreOf={scoreOf} />}
         {tab === "program" && <ProgramTab program={program} setProgram={saveProgram} exByKey={exByKey}
@@ -1160,6 +1214,10 @@ function App() {
         onBrowse={() => { const s0 = swap; setSwap(null); const from = exByKey(s0.fromKey); openPicker(k => { s0.onPick(k, "today"); setPicker(null); }, from ? from.m : ""); }} />}
       {picker && <Picker custom={custom} onAddCustom={addCustom} onPick={picker.onPick} initialQ={picker.initialQ} onClose={() => setPicker(null)} />}
       {howTo && <HowToSheet ex={exByKey(howTo)} video={videos[howTo]} onSaveVideo={url => saveVideo(howTo, url)} onClose={() => setHowTo(null)} />}
+      {account && SOCIAL && <SOCIAL.AccountSheet social={social} flash={flash} onClose={() => setAccount(false)} />}
+      {postPrompt && <ActionSheet onClose={() => setPostPrompt(null)}
+        message={`${postPrompt.msg} Post it to the feed? Friends in the feed see the exercises, sets, duration and gym.`}
+        cancelLabel="Not now" actions={[{ label: "Post to feed", onClick: () => postSession(postPrompt.session) }]} />}
       {toast && <div className="toast" role="status">{toast}</div>}
       <TabBar tab={tab} setTab={goTab} logging={!!draft} />
     </div>
@@ -1187,7 +1245,8 @@ const ICONS = {
   info: <><circle cx="12" cy="12" r="8.5" /><path d="M12 11v5.5M12 7.6v.01" /></>,
   swap: <path d="M7 7.5h11.5l-3-3M17 16.5H5.5l3 3" />,
   play: <path d="M8 5.5v13l10.5-6.5z" />,
-  copy: <><rect x="8.5" y="8.5" width="11" height="11" rx="2" /><path d="M15.5 8.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" /></>
+  copy: <><rect x="8.5" y="8.5" width="11" height="11" rx="2" /><path d="M15.5 8.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" /></>,
+  user: <><circle cx="12" cy="8.5" r="3.8" /><path d="M4.8 19.5c1.3-3.4 4-5.2 7.2-5.2s5.9 1.8 7.2 5.2" /></>
 };
 function Icon({ n, s = 22, w = 1.9 }) {
   return (
@@ -1271,7 +1330,7 @@ function Sheet({ title, onClose, children, foot, bodyStyle }) {
 }
 
 /* iOS-style action sheet. actions: [{ label, onClick, danger, disabled }] */
-function ActionSheet({ message, actions, onClose }) {
+function ActionSheet({ message, actions, onClose, cancelLabel }) {
   return (
     <div className="backdrop" onClick={onClose}>
       <div className="sheet" style={{ background: "transparent" }} onClick={e => e.stopPropagation()} role="dialog" aria-modal="true">
@@ -1286,7 +1345,7 @@ function ActionSheet({ message, actions, onClose }) {
             ))}
           </div>
           <div className="group cancel">
-            <button className="row" onClick={onClose}><span className="row-title">Cancel</span></button>
+            <button className="row" onClick={onClose}><span className="row-title">{cancelLabel || "Cancel"}</span></button>
           </div>
         </div>
       </div>
@@ -2278,8 +2337,9 @@ const weekStart = dateStr => {
   d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
   return fmtDate(d);
 };
-function HistoryList({ sessions, onOpen, scoreOf, onStart }) {
+function HistoryList({ sessions, onOpen, scoreOf, onStart, social, view, setView, onAccount, flash }) {
   const [q, setQ] = useState("");
+  const [feedDetail, setFeedDetail] = useState(false); // a feed post is open: its page has its own header
   const ql = q.trim().toLowerCase();
   const rev = useMemo(() => sessions.slice().sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : 0).filter(s =>
     !ql || s.dayName.toLowerCase().includes(ql) || (s.gym || "").toLowerCase().includes(ql) || s.entries.some(e => e.name.toLowerCase().includes(ql))), [sessions, ql]);
@@ -2293,15 +2353,35 @@ function HistoryList({ sessions, onOpen, scoreOf, onStart }) {
     if (g && g.wk === wk) g.items.push(s); else groups.push({ wk, items: [s] });
   });
   const weekName = wk => wk === thisWk ? "This week" : wk === lastWk ? "Last week" : `Week of ${fmtDay(wk, false)}`;
+
+  const socialOn = !!(social && social.enabled && SOCIAL);
+  const acctBtn = socialOn
+    ? <button className="icon-btn" aria-label={social.user ? "Account" : "Sign in"} onClick={onAccount} style={{ color: social.user ? C.acc : C.ink2 }}><Icon n="user" /></button>
+    : null;
+  const header = (
+    <>
+      <NavBar large title="History" right={acctBtn} />
+      {socialOn && <Seg value={view} onChange={v => { setView(v); setFeedDetail(false); window.scrollTo(0, 0); }} options={[["mine", "Yours"], ["friends", "Friends"]]} style={{ marginTop: 6 }} />}
+    </>
+  );
+  if (socialOn && view === "friends") {
+    return (
+      <div>
+        {!feedDetail && header}
+        <SOCIAL.FriendsFeed social={social} onAccount={onAccount} flash={flash} onDetail={setFeedDetail} />
+      </div>
+    );
+  }
+  const posted = (social && social.posted) || null;
   return (
     <div>
-      <NavBar large title="History" />
+      {header}
       {sessions.length === 0 ? (
         <Empty title="No workouts yet" msg="Finished workouts appear here with their sets, score and notes."
           action={<button className="btn btn-primary" onClick={onStart}>Start a workout</button>} />
       ) : (
         <>
-          <div className="search" style={{ marginTop: 6 }}>
+          <div className="search" style={{ marginTop: socialOn ? 12 : 6 }}>
             <Icon n="search" s={18} />
             <input className="field" type="search" value={q} placeholder="Search workouts, exercises or gyms" aria-label="Search history" onChange={e => setQ(e.target.value)} />
           </div>
@@ -2316,7 +2396,7 @@ function HistoryList({ sessions, onOpen, scoreOf, onStart }) {
                   return (
                     <button key={s.id} className="row" onClick={() => onOpen(s)}>
                       <div className="row-main">
-                        <div className="row-title">{s.dayName}</div>
+                        <div className="row-title">{s.dayName}{posted && posted.has(s.id) && <span className="tag est" style={{ marginLeft: 8 }}>Posted</span>}</div>
                         <div className="row-sub">{meta}</div>
                       </div>
                       {scoreOf && <div style={{ textAlign: "right" }}>
@@ -2336,8 +2416,10 @@ function HistoryList({ sessions, onOpen, scoreOf, onStart }) {
   );
 }
 
-function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf }) {
+function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf, social, onPost, onUnpost, onAccount }) {
   const [confirm, setConfirm] = useState(false);
+  const [confirmUnpost, setConfirmUnpost] = useState(false);
+  const [posting, setPosting] = useState(false);
   const ews = useMemo(() => scoreOf ? scoreOf(session) : null, [scoreOf, session]);
   const exScore = key => ews ? ews.ex.find(x => x.key === key) : null;
   const totalSets = session.entries.reduce((a, e) => a + workSets(e.sets).length, 0);
@@ -2347,6 +2429,10 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf }) 
   const seen = {};
   const sub = [fmtDay(session.date), session.gym, session.bodyweight != null ? `${session.bodyweight} kg bodyweight` : null,
     session.feel != null ? `felt ${session.feel} of 10` : null].filter(Boolean).join(", ");
+  const socialOn = !!(social && social.enabled);
+  const isPosted = socialOn && social.posted.has(session.id);
+  const hasSets = session.entries.some(e => e.sets && e.sets.length);
+  const doPost = async () => { if (posting) return; setPosting(true); try { await onPost(session); } finally { setPosting(false); } };
   return (
     <div>
       <NavBar title="" onBack={onBack} backLabel="History" right={<button className="nav-action" onClick={() => onEdit(session)}>Edit</button>} />
@@ -2424,9 +2510,55 @@ function SessionDetail({ session, onBack, onDelete, onEdit, exByKey, scoreOf }) 
         </>
       )}
       <SessionMuscleBreakdown session={session} exResolve={exByKey} />
+
+      {socialOn && hasSets && (
+        <>
+          <GroupLabel>Feed</GroupLabel>
+          <div className="group">
+            {!social.user ? (
+              <button className="row" onClick={onAccount}>
+                <div className="row-main">
+                  <div className="row-title row-action">Sign in to post</div>
+                  <div className="row-sub">Share this workout with friends in the feed</div>
+                </div>
+                <span className="row-chev"><Icon n="chevR" s={18} /></span>
+              </button>
+            ) : !social.inFeed ? (
+              <button className="row" onClick={onAccount}>
+                <div className="row-main">
+                  <div className="row-title">You're not in the feed</div>
+                  <div className="row-sub">Turn on Show me in the feed to post workouts</div>
+                </div>
+                <span className="row-chev"><Icon n="chevR" s={18} /></span>
+              </button>
+            ) : isPosted ? (
+              <>
+                <div className="row">
+                  <div className="row-main">
+                    <div className="row-title">Posted</div>
+                    <div className="row-sub">Friends in the feed can see it. Edits here update the post.</div>
+                  </div>
+                  <span className="check"><Icon n="check" w={2.4} /></span>
+                </div>
+                <button className="row" onClick={() => setConfirmUnpost(true)}><span className="row-main row-title bad">Remove from feed</span></button>
+              </>
+            ) : (
+              <button className="row" onClick={doPost} disabled={posting}>
+                <div className="row-main">
+                  <div className="row-title row-action">{posting ? "Posting" : "Post to feed"}</div>
+                  <div className="row-sub">Shares exercises, sets, duration and gym. Not bodyweight, notes or injuries.</div>
+                </div>
+              </button>
+            )}
+          </div>
+        </>
+      )}
+
       <button className="btn btn-danger block" style={{ marginTop: 28 }} onClick={() => setConfirm(true)}>Delete workout</button>
-      {confirm && <ActionSheet onClose={() => setConfirm(false)} message="Delete this workout? This can't be undone."
+      {confirm && <ActionSheet onClose={() => setConfirm(false)} message={isPosted ? "Delete this workout? It's also removed from the feed. This can't be undone." : "Delete this workout? This can't be undone."}
         actions={[{ label: "Delete workout", danger: true, onClick: () => onDelete(session.id) }]} />}
+      {confirmUnpost && <ActionSheet onClose={() => setConfirmUnpost(false)} message="Remove this workout from the feed? It stays in your History."
+        actions={[{ label: "Remove from feed", danger: true, onClick: () => onUnpost(session.id) }]} />}
     </div>
   );
 }
@@ -3149,7 +3281,7 @@ function BackupPage({ exportJson, importJson, onReset, onBack }) {
         <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
           onChange={e => { const f = e.target.files[0]; e.target.value = ""; if (f) setConfirmImport(f); }} />
       </div>
-      <div className="group-foot">Your data lives only in this browser on this device. Export a backup regularly.</div>
+      <div className="group-foot">Your workouts live only in this browser on this device. Posting to the feed shares a copy but is not a backup. Export a backup regularly.</div>
       <div className="group" style={{ marginTop: 24 }}>
         <button className="row" onClick={() => setConfirmReset(true)}>
           <div className="row-main"><div className="row-title bad">Reset program</div><div className="row-sub">Replaces your program with the built-in push, pull, legs split. Logged workouts stay.</div></div>
